@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<script>
+    // Connect to server
+    ws = new WebSocket("ws://localhost:7000") // Current computer
+
+    // let clientid = 0
+    // let xid = 10923
+
+    ws.onopen = () => {
+        console.log("Connection opened")
+
+    }
+
+    let clientid = 0
+    let transactionid = 0x32a3f001
+
+    /** Source <https://stackoverflow.com/a/65227338> */
+    function uint8_fromNumber(n, len = 1) {
+        let buf = new Uint8Array(len);
+        if (!n) return buf
+
+        const a = []
+        a.unshift(n & 255)
+        while (n >= 256) {
+            n = n >>> 8
+            a.unshift(n & 255)
+        }
+
+        let aBuf = new Uint8Array(a);
+
+        let diff = buf.length - aBuf.length;
+
+        if (diff < 0) {
+            if (typeof len == "number") {
+                console.warn(n + ": does not fit in specified size")
+                return buf;
+            } else return aBuf;
+        }
+
+        buf.set(aBuf, diff)
+        return buf;
+    }
+
+    async function send() {
+        // initial packet header
+        let encoder = new TextEncoder()
+        let json_data = encoder.encode(JSON.stringify({
+            protocols: ["udp4"],
+            saddr: "127.1.1.1"
+        }))
+
+        let data = new Uint8Array([0, 1, 0, 1, 0, 0, 0, 4, 0x32, 0xa3, 0xf0, 0x01, 0, 0, ...json_data])
+
+        ws.send(data)
+    }
+
+    async function send_packet() {
+        // initial packet header
+        /* udp packet from unsmart-net-tools scream udp carefully transcribed by hand*/
+
+        let etherframe = new Uint8Array([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x45, 0x00,
+            0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0xf7, 0x66, 0x7f, 0x01, 0x01, 0x01, 0x7f, 0x01,
+            0x01, 0x01, 0x0e, 0x38, 0x27, 0x1b, 0x00, 0x0e, 0x77, 0x2f, 0xc0, 0xa8, 0x01, 0x0a, 0x0e, 0x38
+        ])
+
+        // servers skips checksum check
+        transactionid += 1
+        console.log(clientid)
+        etherframe.set([
+            0, 1, 0, 8, ...uint8_fromNumber(clientid, 4), ...uint8_fromNumber(transactionid, 4)
+        ])
+        let data = etherframe
+
+        ws.send(data)
+    }
+
+    async function send2() {
+        // request data
+        let encoder = new TextEncoder()
+
+        let data = new Uint8Array([0, 1, 0, 3, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0])
+
+        ws.send(data)
+    }
+
+    ws.onmessage = async (event) => {
+        let ab = await event.data.arrayBuffer();
+        let buffer = new Uint8Array(ab)
+
+        // get xid
+        let dv = new DataView(ab)
+
+        let cid = dv.getUint32(4)
+        let xid = dv.getUint32(8)
+
+        if (xid == 0x1010101) {
+            console.log(
+                JSON.parse((new TextDecoder()).decode(buffer.slice(14)))
+            )
+            return
+        }
+
+        clientid = cid
+
+        console.log(xid == transactionid)
+
+        console.log("Data received", buffer)
+        // ws.close() // We got the score so we don't need the connection anymore
+    }
+
+    // ws.onclose = (event) => {
+    //     console.log("Connection closed", event.code, event.reason, event.wasClean)
+    // }
+
+    // ws.onerror = () => {
+    //     console.log("Connection closed due to error")
+    // }
+</script>
+
+<button onclick="send()">send</button>
+<button onclick="send2()">request data</button>
+<button onclick="send_packet()">send_packet</button>
