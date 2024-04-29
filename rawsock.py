@@ -112,16 +112,14 @@ class NATManager:
         # create lease
         target_saddr = self.pool4.pick()
 
-        newlease = [
-            NATLease(
-                NATManager.LEASE_TIME,
-                saddr,
-                daddr,
-                target_saddr,
-                NATManager.TARGET_DADDRv4,
-                proto=proto,
-            )
-        ][0]
+        newlease = NATLease(
+            NATManager.LEASE_TIME,
+            saddr,
+            daddr,
+            target_saddr,
+            NATManager.TARGET_DADDRv4,
+            proto=proto,
+        )
 
         for idx, _lease in enumerate(self.leases):
             if _lease.expires < current_time:
@@ -183,6 +181,78 @@ def read_datahdr(
         raise ValueError
 
     return (proto, saddr, daddr)
+
+
+def calculate_checksum(buf: bytes) -> int:
+    i = 0
+    length = len(buf)
+    sum = 0
+
+    while length > 1:
+        data = ((buf[i] << 8) & 0xFF00) | ((buf[i + 1]) & 0xFF)
+        sum += data
+
+        if (sum & 0xFFFF0000) > 0:
+            sum = sum & 0xFFFF
+            sum += 1
+
+        i += 2
+        length -= 2
+
+    if length > 0:
+        sum += buf[i] << 8 & 0xFF00
+        if (sum & 0xFFFF0000) > 0:
+            sum = sum & 0xFFFF
+            sum += 1
+
+    sum = ~sum
+    sum = sum & 0xFFFF
+    return sum
+
+
+def set_bytes(d: bytearray, b: bytes, offset: int):
+    for i in range(len(b)):
+        d[offset + i] = b[i]
+
+
+def bytes_from_number(n: int, l=1):
+    if not n:
+        return bytes(len)
+
+    a = []
+    a.append(n & 255)
+    while n >= 256:
+        n = n >> 8
+        a.append(n & 255)
+
+    a.reverse()
+    b = bytearray(l)
+
+    diff = len(a) - len(b)
+    if diff < 0:
+        raise ValueError
+
+    set_bytes(b, a, diff)
+
+    return bytes(b)
+
+
+def replace_ip4addres(
+    data: bytes, saddr: ipaddress.IPv4Address, daddr: ipaddress.IPv4Address
+):
+    data = bytearray(data)
+
+    set_bytes(data, bytes(2), 10)
+    set_bytes(data, saddr.packed, 12)
+    set_bytes(data, daddr.packed, 16)
+
+    # calculate checksum
+    # do not know if this is wrong just uses give ihl value
+    set_bytes(
+        data,
+        bytes_from_number(calculate_checksum(data[: (data[0] & 0x0F) << 2]), 2),
+        10,
+    )
 
 
 class RawSock:
@@ -250,14 +320,12 @@ class RawSock:
 
             # TODO: replace the source and destination and recalculate checksum
 
-
     def kill_transaction(self, transactionid: int, lease: NATLease):
         # remove transaction from transactions
-        for i , transaction in self.transactions:
+        for i, transaction in self.transactions:
             if transaction[0] == transactionid and transaction[1] == lease:
                 self.transactions.pop(i)
                 return
-        
 
     def output(
         self,
@@ -290,7 +358,9 @@ class RawSock:
             lease.target_daddr,
         )
 
-        # register transaction last
+        replace_ip4addres(data, lease.target_saddr, lease.target_daddr)
+
+        # output the packet but that is for another day.
 
         # finally return a function that closes the transaction
 
@@ -298,7 +368,9 @@ class RawSock:
 
 
 if __name__ == "__main__":
-    rawsock = RawSock()
-    # for testing close the listening thread because otherwise i is annoying
-    time.sleep(5)
-    rawsock.raw_socket_listener_flag = False
+    # rawsock = RawSock()
+    # # for testing close the listening thread because otherwise i is annoying
+    # time.sleep(5)
+    # rawsock.raw_socket_listener_flag = False
+
+    print(bytes_from_number(270, 4))

@@ -202,7 +202,7 @@ class OSIFSClient:
         frame = OSIFSFrame(
             {
                 "version": OSIFS_VERSION,
-                "opcode": OSIFS_OP_REPLY,
+                "opcode": OSIFS_OP_SEND_PACKET,
                 "clientid": self.clientid,
                 "transactionid": transactionid,
                 "ethertype": ethertype,
