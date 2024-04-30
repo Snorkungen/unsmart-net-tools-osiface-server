@@ -325,16 +325,16 @@ class RawSock:
             if not lease:
                 continue
 
-            print("HELLO WOLRD", addr)
             # TODO: replace the source and destination and recalculate checksum
 
-            data = replace_ip4addres(b, lease.source_saddr, lease.source_daddr)
+            data = replace_ip4addres(b, lease.source_daddr, lease.source_saddr)
             
             # get transaction
             for transaction in self.transactions:
                 if transaction[0] != lease:
                     continue
 
+                print(f"replying to: {hex(transaction[1])},  with a pakcket")
                 transaction[2](addr[1], data, transaction[1])
                 
                 self.kill_transaction(transaction[1], lease)
