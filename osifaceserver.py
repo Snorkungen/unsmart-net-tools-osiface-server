@@ -3,7 +3,7 @@ import signal
 import socket
 import struct
 from typing import Any, Callable, Literal, Union
-from rawsock import RawSock
+from ioengine import IOEngineFactory
 import wsserver
 
 """
@@ -177,27 +177,25 @@ class OSIFSClient:
     clientid: int
     options: dict
 
-    _output: Callable[[int, bytes, int, Callable[[int, bytes, int], None]], Callable]
-
     transaction_killers = []
 
     is_alive = True  # thsis is just a hint that there might be a situation where the client is left a zombie
 
     # support udp4 first for the vibes
 
-    def __init__(
-        self, wsconn: wsserver.WSConn, clientid: int, options: dict, output
-    ) -> None:
+    def __init__(self, wsconn: wsserver.WSConn, clientid: int, options: dict) -> None:
         self.wsconn = wsconn
         self.clientid = clientid
 
         self.options = options
-        self._output = output
 
     # the following bottom two methods might no be helpful
 
     def input(self, ethertype: int, data: bytes, transactionid: int):
         """forward data to client using wsconn"""
+
+        # TODO: create some more rigid way of logging
+        print(f"replying to {hex(transactionid)}")
 
         frame = OSIFSFrame(
             {
@@ -216,12 +214,13 @@ class OSIFSClient:
         """receive a packet and output it using the raw socket"""
         # what would be the interaction between RawSock and this
 
+        ioengine = IOEngineFactory.make(ethertype, data)
+
         self.transaction_killers.append(
-            self._output(
+            ioengine.output(
                 ethertype,
                 data,
-                transactionid,
-                self.input,
+                lambda et, d: self.input(et, d, transactionid),
             )
         )
 
@@ -235,11 +234,9 @@ class OSIFServer:
     clients: list[OSIFSClient] = []
     clientid = 0
 
-    rawsock: RawSock
     server: wsserver.WSServer
 
     def __init__(self, saddr="0.0.0.0", port=7000) -> None:
-        self.rawsock = RawSock()
         self.server = wsserver.WSServer((saddr, port))
 
     def run(self):
@@ -284,7 +281,7 @@ class OSIFServer:
         elif frame.opcode == OSIFS_OP_SEND_PACKET:
             self.handle_receive_packet(wsconn, frame)
 
-        print(frame.clientid, "received ws message : ", frame.opcode)
+        print(frame.clientid, "received ws message : ", frame.opcode, f"xid: {hex(frame.transactionid)}")
 
     def handle_receive_initialize_client(
         self, wsconn: wsserver.WSConn, frame: OSIFSFrame
@@ -304,7 +301,6 @@ class OSIFServer:
                 {
                     **options,
                 },
-                self.rawsock.output
             )
 
             self.clients.append(client)
@@ -373,4 +369,5 @@ class OSIFServer:
 
 
 server = OSIFServer()
+print(OSIFServer.__name__, " Server running")
 server.run()

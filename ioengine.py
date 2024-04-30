@@ -1,9 +1,8 @@
-import signal
 import socket
 import struct
 import ipaddress
 import time
-import ctypes, os
+from utils import *
 import threading
 from typing import Any, Callable, Tuple
 
@@ -79,7 +78,6 @@ class NATAddressPool:
     def full(self) -> bool:
         return len(self.used) >= len(self.pool)
 
-
 class NATManager:
     LEASE_TIME = 2 * 60  # 2 minutes
 
@@ -139,23 +137,11 @@ class NATManager:
         # NAT were to smarter request more information and do the checking
         for lease in self.leases:
             if (
-                lease.target_saddr == target_saddr
+                (lease.proto < 0 or lease.proto == proto)
+                and lease.target_saddr == target_saddr
                 and lease.target_daddr == target_daddr
-                and (lease.proto < 0 or lease.proto == proto)
             ):
                 return lease
-
-
-natman = NATManager()
-
-
-def is_admin():
-    try:
-        return os.getuid() == 0
-    except AttributeError:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except:
-        return False
 
 
 # https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_ether.h
@@ -183,61 +169,7 @@ def read_datahdr(
     return (proto, saddr, daddr)
 
 
-def calculate_checksum(buf: bytes) -> int:
-    i = 0
-    length = len(buf)
-    sum = 0
-
-    while length > 1:
-        data = ((buf[i] << 8) & 0xFF00) | ((buf[i + 1]) & 0xFF)
-        sum += data
-
-        if (sum & 0xFFFF0000) > 0:
-            sum = sum & 0xFFFF
-            sum += 1
-
-        i += 2
-        length -= 2
-
-    if length > 0:
-        sum += buf[i] << 8 & 0xFF00
-        if (sum & 0xFFFF0000) > 0:
-            sum = sum & 0xFFFF
-            sum += 1
-
-    sum = ~sum
-    sum = sum & 0xFFFF
-    return sum
-
-
-def set_bytes(d: bytearray, b: bytes, offset: int):
-    for i in range(len(b)):
-        d[offset + i] = b[i]
-
-
-def bytes_from_number(n: int, l=1):
-    if not n:
-        return bytes(len)
-
-    a = []
-    a.append(n & 255)
-    while n >= 256:
-        n = n >> 8
-        a.append(n & 255)
-
-    a.reverse()
-    b = bytearray(l)
-
-    diff = len(b) - len(a)
-    if diff < 0:
-        raise ValueError(diff)
-
-    set_bytes(b, a, diff)
-
-    return bytes(b)
-
-
-def replace_ip4addres(
+def replace_ip4address(
     data: bytes, saddr: ipaddress.IPv4Address, daddr: ipaddress.IPv4Address
 ):
     data = bytearray(data)
@@ -257,146 +189,153 @@ def replace_ip4addres(
     return bytes(data)
 
 
-class RawSock:
-    """
-    The class that communicates through the server host
-    The assumption is that if you send something, youre expected receive a reply to the same address
-    """
+# TODO: circumvent the fact that the loopback routine does not play nice with raw ip sockets
+class IOEngine:
+    """Base class for communication with the operating system, that handles threading"""
 
-    natman: NATManager
+    socket_listener_flag = False
+    thread: threading.Thread = None
 
-    # (NATLease, transactionid, input_function)
-    transactions: list[Tuple[NATLease, int, Callable[[int, bytes, int], None]]]
-    raw_socket_listener_flag = True
+    def start_listening(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return  # thread is already running
 
-    def __init__(self) -> None:
-        self.natman = NATManager()
-        self.transactions = []
+        # somehow setup threading for a function
+        self.socket_listener_flag = True
 
-        self.setup_raw_socket_listeners()
-        self.setup_raw_socket_senders()
+        if not self.thread:
+            self.thread = threading.Thread(None, self.listen_forever, daemon=True)
+        self.thread.start
 
-    def setup_raw_socket_senders(self):
-        if not is_admin():
-            raise PermissionError("You MUST run this script as root")
+    def listen_forever(self):
+        try:
+            while self.socket_listener_flag:
+                self.process_incoming()
+        except Exception as e:
+            self.socket_listener_flag = False
+            raise e
 
-        self.sock_sender = socket.socket(
-            socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW
-        )
-        # self.sock_sender.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    def process_incoming(self):
+        """This method gets called forever untill program ends"""
+        pass
 
-    def setup_raw_socket_listeners(self):
-        if not is_admin():
-            raise PermissionError("You MUST run this script as root")
-
-        # TODO: abstract listening socket and make it work for windows aswell
-        ### ONLY WORKS ON LINUX
-        # https://docs.python.org/3/library/socket.html
-        sock_listener = socket.socket(
-            socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_ALL)
-        )
-
-        # spin up another thread
-
-        thread = threading.Thread(
-            None, self.raw_socket_listener, args=(sock_listener,), daemon=True
-        )
-        thread.start()
-
-    def raw_socket_listener(self, sock: socket.socket):
-        if not is_admin():
-            return
-
-        while self.raw_socket_listener_flag:
-            b, addr = sock.recvfrom(2**16)
-
-            if addr[1] != ETH_P_IP:  # only support IPv4 for now
-                continue
-            if addr[2] == socket.PACKET_OUTGOING:
-                continue  # idk
-
-            # read iphdr
-            proto, saddr, daddr = read_datahdr(addr[1], b)
-
-            lease = self.natman.get_lease(
-                daddr, saddr, proto=proto
-            )  # flipped because this is the receipt of a packet
-
-            if not lease:
-                continue
-
-            # TODO: replace the source and destination and recalculate checksum
-
-            data = replace_ip4addres(b, lease.source_daddr, lease.source_saddr)
-            
-            # get transaction
-            for transaction in self.transactions:
-                if transaction[0] != lease:
-                    continue
-
-                print(f"replying to: {hex(transaction[1])},  with a pakcket")
-                transaction[2](addr[1], data, transaction[1])
-                
-                self.kill_transaction(transaction[1], lease)
-                self.natman.leases.remove(lease)
-
-
-    def kill_transaction(self, transactionid: int, lease: NATLease):
-        # remove transaction from transactions
-        for i, transaction in enumerate(self.transactions):
-            if transaction[0] == transactionid and transaction[1] == lease:
-                self.transactions.pop(i)
-                return
+    def terminate_transaction(self, ident: Any):
+        pass
 
     def output(
         self,
         ethertype: int,
         data: bytes,
-        transactionid: int,
-        input: Callable[[int, bytes, int], None],
+        input: Callable[
+            [int, bytes], None
+        ],  # transaction id has to be bound to input method
     ) -> Callable:
-        """input takes the data and outputs stuff"""  # HMM might need more informatin but will go with this blind interface
+        """
+        Output using the operating system, and do some NAT things
 
+        """
+        return lambda: self.terminate_transaction(None)
+
+
+class RawIPv4IOEngine(IOEngine):
+    natman: NATManager
+    transactions: list[Tuple[NATLease, Callable[[int, bytes], None]]]
+
+    def __init__(self) -> None:
+        self.natman = NATManager()
+        self.transactions = []
+
+        # bind socket to send ip packets including header
+        self.send_socket = socket.socket(
+            socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW
+        )
+
+        # bind socket to receive all ip packets
+        self.listen_socket = socket.socket(
+            socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_IP)
+        )
+
+        self.start_listening()
+
+    def process_incoming(self):
+        b, addr = self.listen_socket.recvfrom(2**16)
+
+        if addr[1] != ETH_P_IP:  # only support IPv4 for now
+            return
+        if addr[2] == socket.PACKET_OUTGOING:
+            return  # idk
+
+        # read iphdr
+        proto, saddr, daddr = read_datahdr(addr[1], b)
+        lease = self.natman.get_lease(
+            daddr, saddr, proto=proto
+        )  # flipped because this is the receipt of a packet
+
+        if not lease:
+            return
+
+        # replace source and destination with the source addresses
+        data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
+
+        # get transaction
+        for transaction in self.transactions:
+            if transaction[0] != lease:
+                continue
+
+            transaction[1](addr[1], data)
+            self.terminate_transaction(lease)
+
+    def terminate_transaction(self, lease: NATLease):
+        for i, transaction in enumerate(self.transactions):
+            if transaction[0] == lease:
+                self.transactions.pop(i)
+                self.natman.leases.remove(lease)
+                return
+
+        # if len(self.transactions) <= 0:
+        #     self.stop_listening()
+
+    def output(
+        self, ethertype: int, data: bytes, input: Callable[[int, bytes], None]
+    ) -> Callable[..., Any]:
         if ethertype != ETH_P_IP:
             return
+
         if len(data) < 20:
             return
 
         # parse iphdr
         proto, saddr, daddr = read_datahdr(ethertype, data)
-
         # obtain lease
         lease = self.natman.lease(saddr, daddr, proto)
 
-        transaction = (lease, transactionid, input)
+        transaction = (lease, input)
 
-        # modify ip packet header
-
-        print(
-            lease.source_saddr,
-            lease.source_daddr,
-            lease.target_saddr,
-            lease.target_daddr,
-        )
-
-        data = replace_ip4addres(data, lease.target_saddr, lease.target_daddr)
+        data = replace_ip4address(data, lease.target_saddr, lease.target_daddr)
         # output the packet but that is for another day.
-        self.sock_sender.sendto(data, (str(lease.target_daddr), 0))
 
-        # finally return a function that closes the transaction
-
+        # self.start_listening()
+        self.send_socket.sendto(data, (str(lease.target_daddr), 0))
         self.transactions.append(transaction)
-        return lambda: self.kill_transaction(transactionid, lease)
+        return lambda: self.terminate_transaction(lease)
+
+
+class IOEngineFactory:
+    """Singleton that gives the users the ability the get an engine"""
+
+    useless_engine = IOEngine()
+    raw_ip_engine = RawIPv4IOEngine()
+
+    @staticmethod
+    def make(ethertype: int, data: bytes) -> IOEngine:
+        if ethertype == 0x0800:
+            return IOEngineFactory.raw_ip_engine
+
+        return IOEngineFactory.useless_engine
 
 
 if __name__ == "__main__":
-    # rawsock = RawSock()
-    # for testing close the listening thread because otherwise i is annoying
-    # time.sleep(10)
-    # rawsock.raw_socket_listener_flag = False
-
-    d = b"\x45\x00\x00\x22\xc5\x19\x00\x00\x40\x11\xb7\x7f\x7f\x30\x00\x01\x7f\x00\x00\x01\x0e\x38\x27\x1b\x00\x0e\x77\x2f\xc0\xa8\x01\x0a\x0e\x38"
-    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-
-    e = s.sendto(d, ("127.0.0.1", 0))
-    print(e)
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_IP))
+    print("receiving")
+    b, addr = s.recvfrom(100)
+    print(b, addr)
