@@ -78,6 +78,7 @@ class NATAddressPool:
     def full(self) -> bool:
         return len(self.used) >= len(self.pool)
 
+
 class NATManager:
     LEASE_TIME = 2 * 60  # 2 minutes
 
@@ -143,6 +144,11 @@ class NATManager:
             ):
                 return lease
 
+    def remove(self, lease: NATLease):
+        self.pool4.drop(lease.target_saddr)
+        self.leases.remove(lease)
+        pass
+
 
 # https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_ether.h
 # define ETH_P_ALL	0x0003		/* Every packet (be careful!!!) */
@@ -203,17 +209,12 @@ class IOEngine:
         # somehow setup threading for a function
         self.socket_listener_flag = True
 
-        if not self.thread:
-            self.thread = threading.Thread(None, self.listen_forever, daemon=True)
-        self.thread.start
+        self.thread = threading.Thread(None, self.listen_forever, daemon=True)
+        self.thread.start()
 
     def listen_forever(self):
-        try:
-            while self.socket_listener_flag:
-                self.process_incoming()
-        except Exception as e:
-            self.socket_listener_flag = False
-            raise e
+        while self.socket_listener_flag:
+            self.process_incoming()
 
     def process_incoming(self):
         """This method gets called forever untill program ends"""
@@ -273,10 +274,22 @@ class RawIPv4IOEngine(IOEngine):
 
         if not lease:
             return
+        # spin up another thread that then finishes the pro
+        threading.Thread(
+            None,
+            self.process_incoming2,
+            args=(
+                b,
+                addr,
+                lease,
+            ),
+        ).start()
+        print("received, the input function is to slow")
+        return
 
-        # replace source and destination with the source addresses
+    def process_incoming2(self, b: bytes, addr, lease: NATLease):
         data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
-
+        print("what is the hangup?") # I'm too tired but adding this print makes it suddenly more responsive
         # get transaction
         for transaction in self.transactions:
             if transaction[0] != lease:
@@ -289,11 +302,8 @@ class RawIPv4IOEngine(IOEngine):
         for i, transaction in enumerate(self.transactions):
             if transaction[0] == lease:
                 self.transactions.pop(i)
-                self.natman.leases.remove(lease)
+                self.natman.remove(lease)
                 return
-
-        # if len(self.transactions) <= 0:
-        #     self.stop_listening()
 
     def output(
         self, ethertype: int, data: bytes, input: Callable[[int, bytes], None]
