@@ -228,9 +228,9 @@ def bytes_from_number(n: int, l=1):
     a.reverse()
     b = bytearray(l)
 
-    diff = len(a) - len(b)
+    diff = len(b) - len(a)
     if diff < 0:
-        raise ValueError
+        raise ValueError(diff)
 
     set_bytes(b, a, diff)
 
@@ -253,6 +253,8 @@ def replace_ip4addres(
         bytes_from_number(calculate_checksum(data[: (data[0] & 0x0F) << 2]), 2),
         10,
     )
+
+    return bytes(data)
 
 
 class RawSock:
@@ -278,6 +280,11 @@ class RawSock:
         if not is_admin():
             raise PermissionError("You MUST run this script as root")
 
+        self.sock_sender = socket.socket(
+            socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW
+        )
+        # self.sock_sender.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+
     def setup_raw_socket_listeners(self):
         if not is_admin():
             raise PermissionError("You MUST run this script as root")
@@ -302,14 +309,14 @@ class RawSock:
 
         while self.raw_socket_listener_flag:
             b, addr = sock.recvfrom(2**16)
+
             if addr[1] != ETH_P_IP:  # only support IPv4 for now
                 continue
+            if addr[2] == socket.PACKET_OUTGOING:
+                continue  # idk
 
             # read iphdr
-            values = struct.unpack("!BBHHHBBHII", b[:20])
-            proto = values[6]
-            saddr = ipaddress.IPv4Address(values[8])
-            daddr = ipaddress.IPv4Address(values[9])
+            proto, saddr, daddr = read_datahdr(addr[1], b)
 
             lease = self.natman.get_lease(
                 daddr, saddr, proto=proto
@@ -318,11 +325,25 @@ class RawSock:
             if not lease:
                 continue
 
+            print("HELLO WOLRD", addr)
             # TODO: replace the source and destination and recalculate checksum
+
+            data = replace_ip4addres(b, lease.source_saddr, lease.source_daddr)
+            
+            # get transaction
+            for transaction in self.transactions:
+                if transaction[0] != lease:
+                    continue
+
+                transaction[2](addr[1], data, transaction[1])
+                
+                self.kill_transaction(transaction[1], lease)
+                self.natman.leases.remove(lease)
+
 
     def kill_transaction(self, transactionid: int, lease: NATLease):
         # remove transaction from transactions
-        for i, transaction in self.transactions:
+        for i, transaction in enumerate(self.transactions):
             if transaction[0] == transactionid and transaction[1] == lease:
                 self.transactions.pop(i)
                 return
@@ -358,19 +379,24 @@ class RawSock:
             lease.target_daddr,
         )
 
-        replace_ip4addres(data, lease.target_saddr, lease.target_daddr)
-
+        data = replace_ip4addres(data, lease.target_saddr, lease.target_daddr)
         # output the packet but that is for another day.
+        self.sock_sender.sendto(data, (str(lease.target_daddr), 0))
 
         # finally return a function that closes the transaction
 
+        self.transactions.append(transaction)
         return lambda: self.kill_transaction(transactionid, lease)
 
 
 if __name__ == "__main__":
     # rawsock = RawSock()
-    # # for testing close the listening thread because otherwise i is annoying
-    # time.sleep(5)
+    # for testing close the listening thread because otherwise i is annoying
+    # time.sleep(10)
     # rawsock.raw_socket_listener_flag = False
 
-    print(bytes_from_number(270, 4))
+    d = b"\x45\x00\x00\x22\xc5\x19\x00\x00\x40\x11\xb7\x7f\x7f\x30\x00\x01\x7f\x00\x00\x01\x0e\x38\x27\x1b\x00\x0e\x77\x2f\xc0\xa8\x01\x0a\x0e\x38"
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+
+    e = s.sendto(d, ("127.0.0.1", 0))
+    print(e)
