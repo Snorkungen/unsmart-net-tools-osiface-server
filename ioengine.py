@@ -105,8 +105,11 @@ class NATManager:
         proto=-1,
         # start of kwargs
         clientid: int = None,
-    ) -> NATLease:
-        """clientid is for allowing the reuse of an target_saddr, but still returns a new lease"""
+    ) -> Optional[NATLease]:
+        """
+            clientid is for allowing the reuse of an target_saddr, but still returns a new lease
+            only returns a lease if a destination is found
+        """
 
         if not isinstance(saddr, ipaddress.IPv4Address) or not isinstance(
             daddr, ipaddress.IPv4Address
@@ -346,6 +349,9 @@ class RawIPv4IOEngine(IOEngine):
         proto, saddr, daddr = read_datahdr(ethertype, data)
         # obtain lease
         lease = self.natman.lease(saddr, daddr, proto, clientid=clientid)
+
+        if not lease:
+            return lambda: None # no lease found, silently quit 
 
         transaction = (lease, input)
 
