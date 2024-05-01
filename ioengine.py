@@ -4,7 +4,7 @@ import ipaddress
 import time
 from utils import *
 import threading
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, Union
 
 
 class NATLease:
@@ -50,18 +50,24 @@ class NATAddressPool:
 
     pool: list[ipaddress._BaseAddress]  # just pre-compute addresses in the beginning
     used: set[int]  # associative array containing indices of the used addresses
+    network: ipaddress.IPv4Network
 
     def __init__(self, network: ipaddress.IPv4Network) -> None:
+        self.network = network
         self.pool = []
         self.used = set()
 
         hosts = network.hosts()
 
-        while len(self.pool) < NATAddressPool.MAX_SIZE:
-            try:
-                self.pool.append(next(hosts))
-            except StopIteration:
-                break
+        if isinstance(hosts, list):
+            # edge case where there is only one possible host
+            self.pool.extend(hosts)
+        else:
+            while len(self.pool) < NATAddressPool.MAX_SIZE:
+                try:
+                    self.pool.append(next(hosts))
+                except StopIteration:
+                    break
 
     def pick(self) -> ipaddress._BaseAddress:
         for idx in range(len(self.pool)):
@@ -85,18 +91,67 @@ class NATAddressPool:
 
 class NATManager:
     LEASE_TIME = 40  # 40 seconds
-
-    TARGET_DADDRv4 = ipaddress.IPv4Address(
-        "127.0.0.1"
-    )  # only communicate on local host for now
-    # TARGET_DADDRv6 = ipaddress.IPv6Address("::1") # only communicate on local host for now
-
     leases: list[NATLease]
-    pool4: NATAddressPool
 
-    def __init__(self, network4=ipaddress.IPv4Network("127.48.0.0/16")) -> None:
+    def __init__(
+        self,
+        natmap: dict[
+            Union[str, ipaddress._BaseAddress],
+            Tuple[
+                Union[str, ipaddress._BaseAddress], Union[str, ipaddress._BaseNetwork]
+            ],
+        ] = {},
+    ) -> None:
         self.leases = []
-        self.pool4 = NATAddressPool(network4)
+
+        # just use a map
+        self.source_daddr_lookup_table: dict[
+            ipaddress._BaseAddress, Tuple[ipaddress._BaseAddress, NATAddressPool]
+        ] = {}
+
+        # popluate source_daddr_lookup_table
+        for source_daddr in natmap:
+            target_daddr, target_saddr_network = natmap[source_daddr]
+            source_daddr, value = NATManager._create_source_daddr_lookup_table_value(
+                self.source_daddr_lookup_table,
+                source_daddr,
+                target_daddr,
+                target_saddr_network,
+            )
+
+            self.source_daddr_lookup_table[source_daddr] = value
+
+        self.leases = []
+        self.pool4 = NATAddressPool(ipaddress.IPv4Network("127.48.0.0/16"))
+
+    @staticmethod
+    def _create_source_daddr_lookup_table_value(
+        lookup_table: dict[
+            ipaddress._BaseAddress, Tuple[ipaddress._BaseAddress, NATAddressPool]
+        ],
+        source_daddr: Union[str, ipaddress._BaseAddress],
+        target_daddr: Union[str, ipaddress._BaseAddress],
+        target_saddr_network: Union[str, ipaddress._BaseNetwork],
+    ) -> Tuple[ipaddress._BaseAddress, Tuple[ipaddress._BaseAddress, NATAddressPool]]:
+        # first assume we're using an ipv4 address
+        try:
+            source_daddr = ipaddress.IPv4Address(source_daddr)
+            target_daddr = ipaddress.IPv4Address(target_daddr)
+            target_saddr_network = ipaddress.IPv4Network(
+                target_saddr_network
+            )  # let NetmaskValueError bubble up
+        except ipaddress.AddressValueError:
+            # allow errors to bubble up
+            source_daddr = ipaddress.IPv6Address(source_daddr)
+            target_daddr = ipaddress.IPv6Address(target_daddr)
+            target_saddr_network = ipaddress.IPv6Network(target_saddr_network)
+
+        # disallow multiple of the same source_daddr
+
+        if source_daddr in lookup_table:
+            raise ValueError(source_daddr, "appears in natmap more than once")
+
+        return source_daddr, (target_daddr, NATAddressPool(target_saddr_network))
 
     def lease(
         self,
@@ -107,8 +162,8 @@ class NATManager:
         clientid: int = None,
     ) -> Optional[NATLease]:
         """
-            clientid is for allowing the reuse of an target_saddr, but still returns a new lease
-            only returns a lease if a destination is found
+        clientid is for allowing the reuse of an target_saddr, but still returns a new lease
+        only returns a lease if a destination is found
         """
 
         if not isinstance(saddr, ipaddress.IPv4Address) or not isinstance(
@@ -116,9 +171,12 @@ class NATManager:
         ):
             raise ValueError
 
-        current_time = time.time()
+        if not daddr in self.source_daddr_lookup_table:
+            return None  # failed to find the destination
 
+        current_time = time.time()
         target_saddr: ipaddress._BaseAddress = None
+        target_daddr, pool = self.source_daddr_lookup_table[daddr]
 
         # check if client already has a target_saddr
         if clientid:
@@ -126,9 +184,13 @@ class NATManager:
                 if _lease.clientid == clientid:
                     target_saddr = _lease.target_saddr
                     break
+        if pool.full():
+            print(pool.used, "Pool is full")
+            # this is dangerous territory
+            return None  # there should be some kind of recovery logic here
 
         if not target_saddr:
-            target_saddr = self.pool4.pick()
+            target_saddr = pool.pick()
 
         # create lease
         newlease = NATLease(
@@ -136,14 +198,15 @@ class NATManager:
             saddr,
             daddr,
             target_saddr,
-            NATManager.TARGET_DADDRv4,
+            target_daddr,
             proto=proto,
             clientid=clientid,
         )
 
         for idx, _lease in enumerate(self.leases):
             if _lease.expires < current_time:
-                self.pool4.drop(_lease.target_saddr)
+                # here the issue in what pool is this
+                self.remove(_lease, modify_leases=False)
                 self.leases[idx] = newlease
                 return self.leases[idx]
         else:
@@ -165,10 +228,13 @@ class NATManager:
             ):
                 return lease
 
-    def remove(self, lease: NATLease):
-        self.pool4.drop(lease.target_saddr)
-        self.leases.remove(lease)
-        pass
+    def remove(self, lease: NATLease, modify_leases=True):
+        # get the pool from the lookup table
+        _, pool = self.source_daddr_lookup_table[lease.source_daddr]
+        pool.drop(lease.target_saddr)
+
+        if modify_leases:
+            self.leases.remove(lease)
 
 
 # https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/if_ether.h
@@ -227,11 +293,16 @@ class IOEngine:
         if self.thread and self.thread.is_alive():
             return  # thread is already running
 
+        self.setup()
+
         # somehow setup threading for a function
         self.socket_listener_flag = True
 
         self.thread = threading.Thread(None, self.listen_forever, daemon=True)
         self.thread.start()
+
+    def setup(self) -> None:
+        pass
 
     def listen_forever(self):
         while self.socket_listener_flag:
@@ -264,10 +335,14 @@ class RawIPv4IOEngine(IOEngine):
     natman: NATManager
     transactions: list[Tuple[NATLease, Callable[[int, bytes], None]]]
 
-    def __init__(self, natman: NATManager = NATManager(), self_start=True) -> None:
+    def __init__(self, natman: NATManager = None, self_start=True) -> None:
         self.natman = natman
         self.transactions = []
 
+        if self_start:
+            self.start_listening()
+
+    def setup(self) -> None:
         # bind socket to send ip packets including header
         self.send_socket = socket.socket(
             socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW
@@ -277,9 +352,6 @@ class RawIPv4IOEngine(IOEngine):
         self.listen_socket = socket.socket(
             socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_IP)
         )
-
-        if self_start:
-            self.start_listening()
 
     def process_incoming(self):
         b, addr = self.listen_socket.recvfrom(2**16)
@@ -351,7 +423,7 @@ class RawIPv4IOEngine(IOEngine):
         lease = self.natman.lease(saddr, daddr, proto, clientid=clientid)
 
         if not lease:
-            return lambda: None # no lease found, silently quit 
+            return lambda: None  # no lease found, silently quit
 
         transaction = (lease, input)
 
@@ -368,11 +440,14 @@ class RawIPv4IOEngine(IOEngine):
         return lambda: self.terminate_transaction(lease)
 
 
+natman: NATManager = None  # reuse natman
+
+
 class IOEngineFactory:
     """Singleton that gives the users the ability the get an engine"""
 
     useless_engine = IOEngine()
-    raw_ip_engine = RawIPv4IOEngine(self_start=False)
+    raw_ip_engine = RawIPv4IOEngine(natman=natman, self_start=False)
 
     @staticmethod
     def make(ethertype: int, data: bytes) -> IOEngine:
@@ -387,7 +462,16 @@ class IOEngineFactory:
 
 
 if __name__ == "__main__":
-    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_IP))
-    print("receiving")
-    b, addr = s.recvfrom(100)
-    print(b, addr)
+    natman = NATManager(
+        natmap={
+            ipaddress.IPv4Address("10.1.1.40"): ("127.1.1.1", "127.48.0.0/16"),
+            "10.1.1.4": ("192.168.1.201", "192.168.1.201"),
+        }
+    )
+
+    lease = natman.lease(ipaddress.IPv4Address("172.16.143.1"), ipaddress.IPv4Address("10.1.1.40"))
+    print(lease.target_saddr, lease.target_daddr)
+    lease = natman.lease(ipaddress.IPv4Address("172.16.143.3"), ipaddress.IPv4Address("10.1.1.40"))
+    print(lease.target_saddr, lease.target_daddr)
+
+    print(natman.source_daddr_lookup_table[ipaddress.IPv4Address("10.1.1.40")][1])
