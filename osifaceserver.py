@@ -1,6 +1,4 @@
 import json
-import signal
-import socket
 import struct
 from typing import Any, Callable, Literal, Union
 from ioengine import IOEngineFactory
@@ -221,6 +219,7 @@ class OSIFSClient:
                 ethertype,
                 data,
                 lambda et, d: self.input(et, d, transactionid),
+                clientid=self.clientid
             )
         )
 
@@ -242,8 +241,8 @@ class OSIFServer:
     def run(self):
         self.server.onreceive(self.handle_receive)
         self.server.onclose(self.handle_close)
-        self.server.serve_forever()
-
+        IOEngineFactory.start()
+        self.server.serve_forever() # serve_forever is blocking
         # to do check if this thing would be capable of supporting stuff i.e raw socket requires
         # admin privileges
         return []

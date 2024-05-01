@@ -4,11 +4,12 @@ import ipaddress
 import time
 from utils import *
 import threading
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 
 class NATLease:
     expires: int  # when lease should be removed
+    clientid: int = None  # value for tying leases to the same client
 
     proto: int
 
@@ -30,6 +31,7 @@ class NATLease:
         target_saddr: ipaddress._IPAddressBase,
         target_daddr: ipaddress._IPAddressBase,
         proto=-1,
+        clientid: int = None,
     ) -> None:
         self.expires = time.time() + lease_time
 
@@ -39,6 +41,8 @@ class NATLease:
         self.target_daddr = target_daddr
 
         self.proto = proto
+
+        self.clientid = clientid
 
 
 class NATAddressPool:
@@ -69,8 +73,8 @@ class NATAddressPool:
 
     def drop(self, address: ipaddress._BaseAddress):
         for idx in range(len(self.pool)):
-            if (
-                self.pool[idx] == address
+            if self.pool[idx] == address and (
+                idx in self.used  # prevent KeyError
             ):  # idk if this compares objects or actually compares the address
                 self.used.remove(idx)
                 return
@@ -80,7 +84,7 @@ class NATAddressPool:
 
 
 class NATManager:
-    LEASE_TIME = 2 * 60  # 2 minutes
+    LEASE_TIME = 40  # 40 seconds
 
     TARGET_DADDRv4 = ipaddress.IPv4Address(
         "127.0.0.1"
@@ -99,7 +103,10 @@ class NATManager:
         saddr: ipaddress._IPAddressBase,
         daddr: ipaddress._IPAddressBase,
         proto=-1,
+        # start of kwargs
+        clientid: int = None,
     ) -> NATLease:
+        """clientid is for allowing the reuse of an target_saddr, but still returns a new lease"""
 
         if not isinstance(saddr, ipaddress.IPv4Address) or not isinstance(
             daddr, ipaddress.IPv4Address
@@ -108,9 +115,19 @@ class NATManager:
 
         current_time = time.time()
 
-        # create lease
-        target_saddr = self.pool4.pick()
+        target_saddr: ipaddress._BaseAddress = None
 
+        # check if client already has a target_saddr
+        if clientid:
+            for _lease in self.leases:
+                if _lease.clientid == clientid:
+                    target_saddr = _lease.target_saddr
+                    break
+
+        if not target_saddr:
+            target_saddr = self.pool4.pick()
+
+        # create lease
         newlease = NATLease(
             NATManager.LEASE_TIME,
             saddr,
@@ -118,6 +135,7 @@ class NATManager:
             target_saddr,
             NATManager.TARGET_DADDRv4,
             proto=proto,
+            clientid=clientid,
         )
 
         for idx, _lease in enumerate(self.leases):
@@ -230,6 +248,7 @@ class IOEngine:
         input: Callable[
             [int, bytes], None
         ],  # transaction id has to be bound to input method
+        clientid: int = None,
     ) -> Callable:
         """
         Output using the operating system, and do some NAT things
@@ -242,8 +261,8 @@ class RawIPv4IOEngine(IOEngine):
     natman: NATManager
     transactions: list[Tuple[NATLease, Callable[[int, bytes], None]]]
 
-    def __init__(self) -> None:
-        self.natman = NATManager()
+    def __init__(self, natman: NATManager = NATManager(), self_start=True) -> None:
+        self.natman = natman
         self.transactions = []
 
         # bind socket to send ip packets including header
@@ -256,7 +275,8 @@ class RawIPv4IOEngine(IOEngine):
             socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_IP)
         )
 
-        self.start_listening()
+        if self_start:
+            self.start_listening()
 
     def process_incoming(self):
         b, addr = self.listen_socket.recvfrom(2**16)
@@ -274,8 +294,9 @@ class RawIPv4IOEngine(IOEngine):
 
         if not lease:
             return
+
         # spin up another thread that then finishes the pro
-        threading.Thread(
+        return threading.Thread(
             None,
             self.process_incoming2,
             args=(
@@ -283,19 +304,22 @@ class RawIPv4IOEngine(IOEngine):
                 addr,
                 lease,
             ),
+            daemon=True,
         ).start()
-        print("received, the input function is to slow")
-        return
 
     def process_incoming2(self, b: bytes, addr, lease: NATLease):
         data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
-        print("what is the hangup?") # I'm too tired but adding this print makes it suddenly more responsive
+        print(
+            "I should be replying but something is going wrong", len(self.transactions)
+        )
         # get transaction
         for transaction in self.transactions:
             if transaction[0] != lease:
                 continue
 
             transaction[1](addr[1], data)
+            # just accept the fact that zombie transaction will exist untill the client terminates the transaction
+            # i do not know what i'm doing, it works but i do not like how it works
             self.terminate_transaction(lease)
 
     def terminate_transaction(self, lease: NATLease):
@@ -306,7 +330,11 @@ class RawIPv4IOEngine(IOEngine):
                 return
 
     def output(
-        self, ethertype: int, data: bytes, input: Callable[[int, bytes], None]
+        self,
+        ethertype: int,
+        data: bytes,
+        input: Callable[[int, bytes], None],
+        clientid: int = None,
     ) -> Callable[..., Any]:
         if ethertype != ETH_P_IP:
             return
@@ -317,16 +345,20 @@ class RawIPv4IOEngine(IOEngine):
         # parse iphdr
         proto, saddr, daddr = read_datahdr(ethertype, data)
         # obtain lease
-        lease = self.natman.lease(saddr, daddr, proto)
+        lease = self.natman.lease(saddr, daddr, proto, clientid=clientid)
 
         transaction = (lease, input)
 
         data = replace_ip4address(data, lease.target_saddr, lease.target_daddr)
         # output the packet but that is for another day.
 
-        # self.start_listening()
         self.send_socket.sendto(data, (str(lease.target_daddr), 0))
         self.transactions.append(transaction)
+
+        print(
+            [(l.clientid, str(l.target_saddr), l.expires) for l in self.natman.leases]
+        )
+
         return lambda: self.terminate_transaction(lease)
 
 
@@ -334,7 +366,7 @@ class IOEngineFactory:
     """Singleton that gives the users the ability the get an engine"""
 
     useless_engine = IOEngine()
-    raw_ip_engine = RawIPv4IOEngine()
+    raw_ip_engine = RawIPv4IOEngine(self_start=False)
 
     @staticmethod
     def make(ethertype: int, data: bytes) -> IOEngine:
@@ -342,6 +374,10 @@ class IOEngineFactory:
             return IOEngineFactory.raw_ip_engine
 
         return IOEngineFactory.useless_engine
+
+    @staticmethod
+    def start():
+        IOEngineFactory.raw_ip_engine.start_listening()
 
 
 if __name__ == "__main__":
