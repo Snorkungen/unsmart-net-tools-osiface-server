@@ -184,9 +184,9 @@ class NATManager:
                 if _lease.clientid == clientid:
                     target_saddr = _lease.target_saddr
                     break
+
         if pool.full():
-            print(pool.used, "Pool is full")
-            # this is dangerous territory
+            print(pool.used, "Pool is full", pool.network)
             return None  # there should be some kind of recovery logic here
 
         if not target_saddr:
@@ -384,9 +384,7 @@ class RawIPv4IOEngine(IOEngine):
 
     def process_incoming2(self, b: bytes, addr, lease: NATLease):
         data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
-        print(
-            "I should be replying but something is going wrong", len(self.transactions)
-        )
+
         # get transaction
         for transaction in self.transactions:
             if transaction[0] != lease:
@@ -433,32 +431,27 @@ class RawIPv4IOEngine(IOEngine):
         self.send_socket.sendto(data, (str(lease.target_daddr), 0))
         self.transactions.append(transaction)
 
-        print(
-            [(l.clientid, str(l.target_saddr), l.expires) for l in self.natman.leases]
-        )
-
         return lambda: self.terminate_transaction(lease)
 
-
-natman: NATManager = None  # reuse natman
-
-
 class IOEngineFactory:
-    """Singleton that gives the users the ability the get an engine"""
+    natman: NATManager
+    useless_engine: IOEngine
+    raw_ip_engine: RawIPv4IOEngine
 
-    useless_engine = IOEngine()
-    raw_ip_engine = RawIPv4IOEngine(natman=natman, self_start=False)
+    def __init__(self, natman: NATManager) -> None:
+        self.natman = natman
+        self.useless_engine = IOEngine()
+        self.raw_ip_engine = RawIPv4IOEngine(self.natman, self_start=False)
+        pass
 
-    @staticmethod
-    def make(ethertype: int, data: bytes) -> IOEngine:
+    def make(self, ethertype: int, data: bytes) -> IOEngine:
         if ethertype == 0x0800:
-            return IOEngineFactory.raw_ip_engine
+            return self.raw_ip_engine
 
-        return IOEngineFactory.useless_engine
+        return self.useless_engine
 
-    @staticmethod
-    def start():
-        IOEngineFactory.raw_ip_engine.start_listening()
+    def start(self):
+        self.raw_ip_engine.start_listening()
 
 
 if __name__ == "__main__":
@@ -469,9 +462,17 @@ if __name__ == "__main__":
         }
     )
 
-    lease = natman.lease(ipaddress.IPv4Address("172.16.143.1"), ipaddress.IPv4Address("10.1.1.40"))
+    lease = natman.lease(
+        ipaddress.IPv4Address("172.16.143.2"),
+        ipaddress.IPv4Address("10.1.1.4"),
+        proto=17,
+    )
     print(lease.target_saddr, lease.target_daddr)
-    lease = natman.lease(ipaddress.IPv4Address("172.16.143.3"), ipaddress.IPv4Address("10.1.1.40"))
-    print(lease.target_saddr, lease.target_daddr)
+    lease = natman.lease(
+        ipaddress.IPv4Address("172.16.143.2"),
+        ipaddress.IPv4Address("10.1.1.4"),
+        proto=-1,
+    )
+    print(lease)
 
     print(natman.source_daddr_lookup_table[ipaddress.IPv4Address("10.1.1.40")][1])

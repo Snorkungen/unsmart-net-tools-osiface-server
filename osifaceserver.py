@@ -1,7 +1,7 @@
 import json
 import struct
-from typing import Any, Callable, Literal, Union
-from ioengine import IOEngineFactory
+from typing import Any, Literal, Union
+from ioengine import IOEngineFactory, NATManager
 import wsserver
 
 """
@@ -17,55 +17,14 @@ import wsserver
     data            - 1486-bytes
 """
 
-"""
-    initialize a client
-    client sets transaction id
-    server chooses client id
-    
-    "i.e HWInterface["connect"] => ..."
-    
-    opcode          - 0x1
-    clientid        - 0x0
-    transaction id  - ...
-    pad             - 0x0
-
-    data            - utf-8 JSON with configured options and other stuff
-"""
-
-"""
-    server response
-
-    opcode          - 0x2
-    clientid        - ...
-    transactionid   - ...
-    pad             0x0
-
-    data            - utf-8 JSON with a response informat and capabilities, "something something raw socket"
-"""
-
-"""
-    client fetch information from server
-
-    opcode          - 0x3
-    opcode          - 0x4
-    opcode          - 0x5
-    opcode          - 0x6
-    opcode          - 0x7
-"""
-
-"""
-    client/server send a packet
-    opcode          - 0x8
-    ethertype       - IPv4 or IPv6
-
-    depending on what the server is capable to do it read and parse and try to send data
-"""
-
 OSIFS_VERSION = 1
 OSIFS_OP_INIT = 1
 OSIFS_OP_REPLY = 2
 OSIFS_OP_FETCH_CLIENTS = 3
 OSIFS_OP_SEND_PACKET = 8
+
+natman = NATManager({"10.1.1.40": ("127.1.1.1", "127.48.0.0/16")})
+ioengine_factory = IOEngineFactory(natman)
 
 
 class OSIFSFrame:
@@ -212,14 +171,14 @@ class OSIFSClient:
         """receive a packet and output it using the raw socket"""
         # what would be the interaction between RawSock and this
 
-        ioengine = IOEngineFactory.make(ethertype, data)
+        ioengine = ioengine_factory.make(ethertype, data)
 
         self.transaction_killers.append(
             ioengine.output(
                 ethertype,
                 data,
                 lambda et, d: self.input(et, d, transactionid),
-                clientid=self.clientid
+                clientid=self.clientid,
             )
         )
 
@@ -241,8 +200,7 @@ class OSIFServer:
     def run(self):
         self.server.onreceive(self.handle_receive)
         self.server.onclose(self.handle_close)
-        IOEngineFactory.start()
-        self.server.serve_forever() # serve_forever is blocking
+        self.server.serve_forever()  # serve_forever is blocking
         # to do check if this thing would be capable of supporting stuff i.e raw socket requires
         # admin privileges
         return []
@@ -280,7 +238,12 @@ class OSIFServer:
         elif frame.opcode == OSIFS_OP_SEND_PACKET:
             self.handle_receive_packet(wsconn, frame)
 
-        print(frame.clientid, "received ws message : ", frame.opcode, f"xid: {hex(frame.transactionid)}")
+        print(
+            frame.clientid,
+            "received ws message : ",
+            frame.opcode,
+            f"xid: {hex(frame.transactionid)}",
+        )
 
     def handle_receive_initialize_client(
         self, wsconn: wsserver.WSConn, frame: OSIFSFrame
@@ -368,5 +331,7 @@ class OSIFServer:
 
 
 server = OSIFServer()
+ioengine_factory.start()
+
 print(OSIFServer.__name__, " Server running")
 server.run()
