@@ -456,6 +456,7 @@ class RawIPv4IOEngine(IOEngine):
         lease = self.natman.lease(saddr, daddr, proto, clientid=clientid)
 
         if not lease:
+            logger.err(f"failed to send packet, no lease found for {daddr}")
             return lambda: None  # no lease found, silently quit
 
         transaction = (lease, input)

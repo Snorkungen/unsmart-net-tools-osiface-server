@@ -12,7 +12,9 @@
     }
 
     let clientid = 0
-    let transactionid = 0x32a3f001
+    let init_xid = 0x1
+    let packet_xid = 0x2
+    let fetch_xid = 0x37219
 
     /** Source <https://stackoverflow.com/a/65227338> */
     function uint8_fromNumber(n, len = 1) {
@@ -41,17 +43,12 @@
         return buf;
     }
 
-    console.log(uint8_fromNumber(270, 2))
-
     async function send() {
         // initial packet header
         let encoder = new TextEncoder()
-        let json_data = encoder.encode(JSON.stringify({
-            protocols: ["udp4"],
-            saddr: "127.1.1.1"
-        }))
+        let json_data = encoder.encode(JSON.stringify({}))
 
-        let data = new Uint8Array([0, 1, 0, 1, 0, 0, 0, 4, 0x32, 0xa3, 0xf0, 0x01, 0, 0, ...json_data])
+        let data = new Uint8Array([0, 1, 0, 1, 0, 0, 0, 0, ...uint8_fromNumber(init_xid, 4), 0, 0, ...json_data])
 
         ws.send(data)
     }
@@ -77,14 +74,13 @@
             0x36, 0x37
         ])
 
-
-
-
-        transactionid += 1
-        console.log(clientid)
+        
         etherframe.set([
-            0, 1, 0, 8, ...uint8_fromNumber(clientid, 4), ...uint8_fromNumber(transactionid, 4)
+            0, 1, 0, 8, ...uint8_fromNumber(clientid, 4), ...uint8_fromNumber(packet_xid, 4)
         ])
+
+        // set the correct destination address server does not check checksum
+        etherframe.set([10,1,1,40], 14 + (20 - 4))
         let data = etherframe
 
         ws.send(data)
@@ -94,7 +90,7 @@
         // request data
         let encoder = new TextEncoder()
 
-        let data = new Uint8Array([0, 1, 0, 3, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0])
+        let data = new Uint8Array([0, 1, 0, 3, 0, 0, 0, 0, ...uint8_fromNumber(fetch_xid, 4), 0, 0])
 
         ws.send(data)
     }
@@ -109,16 +105,22 @@
         let cid = dv.getUint32(4)
         let xid = dv.getUint32(8)
 
-        if (xid == 0x1010101) {
-            console.log(
-                JSON.parse((new TextDecoder()).decode(buffer.slice(14)))
-            )
-            return
+        switch (xid) {
+            case init_xid:
+                clientid = cid
+                console.log(
+                    JSON.parse((new TextDecoder()).decode(buffer.slice(14)))
+                )
+                break;
+            case fetch_xid:
+                console.log(
+                    JSON.parse((new TextDecoder()).decode(buffer.slice(14)))
+                )
+                return
         }
 
         clientid = cid
 
-        console.log(xid == transactionid)
 
         console.log("Data received", buffer)
         // ws.close() // We got the score so we don't need the connection anymore

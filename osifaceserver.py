@@ -2,6 +2,7 @@ import json
 import struct
 from typing import Any, Literal, Union
 from ioengine import IOEngineFactory, NATManager
+from utils import *
 import wsserver
 
 """
@@ -17,6 +18,10 @@ import wsserver
     data            - 1486-bytes
 """
 
+"""
+    NOTE: this servers communication is not reliable
+"""
+
 OSIFS_VERSION = 1
 OSIFS_OP_INIT = 1
 OSIFS_OP_REPLY = 2
@@ -25,6 +30,12 @@ OSIFS_OP_SEND_PACKET = 8
 
 natman = NATManager({"10.1.1.40": ("127.1.1.1", "127.48.0.0/16")})
 ioengine_factory = IOEngineFactory(natman)
+
+
+def get_server_configuration_options() -> dict:
+    destinations = [str(k) for k in natman.source_daddr_lookup_table]
+
+    return {"destinations": destinations}
 
 
 class OSIFSFrame:
@@ -151,8 +162,9 @@ class OSIFSClient:
     def input(self, ethertype: int, data: bytes, transactionid: int):
         """forward data to client using wsconn"""
 
-        # TODO: create some more rigid way of logging
-        print(f"replying to {hex(transactionid)}")
+        logger.success(
+            f"sending packet, ett: {ethertype:#x}, cid: {self.clientid:#x}, xid: {transactionid:#x}"
+        )
 
         frame = OSIFSFrame(
             {
@@ -203,26 +215,7 @@ class OSIFServer:
         self.server.serve_forever()  # serve_forever is blocking
         # to do check if this thing would be capable of supporting stuff i.e raw socket requires
         # admin privileges
-        return []
-
-    def recover_client(
-        self, wsconn: wsserver.WSConn, frame: OSIFSFrame
-    ) -> Union[None, OSIFSClient]:
-        # if i really wanted to do this wsconn could store the http headers
-        # check that this could be a recovery of a client connection
-
-        # TODO: this is only relevant if there are queued messages
-
-        for i in range(len(self.clients)):
-            if self.clients[i].clientid == frame.clientid and (
-                self.clients[i].wsconn.request.getpeername()[0]
-                == wsconn.request.getpeername()[0]
-            ):
-                # now we could pressume that this is an attempt at a recovery of a connection
-
-                self.clients[i].wsconn = wsconn
-
-                return self.clients[i]
+        return
 
     def handle_receive(self, wsconn: wsserver.WSConn, data: bytes):
         frame = OSIFSFrame(data)
@@ -238,21 +231,11 @@ class OSIFServer:
         elif frame.opcode == OSIFS_OP_SEND_PACKET:
             self.handle_receive_packet(wsconn, frame)
 
-        print(
-            frame.clientid,
-            "received ws message : ",
-            frame.opcode,
-            f"xid: {hex(frame.transactionid)}",
-        )
-
     def handle_receive_initialize_client(
         self, wsconn: wsserver.WSConn, frame: OSIFSFrame
     ):
         options = frame.options()
         client: OSIFSClient = None
-
-        if frame.clientid and "recover" in options:
-            client = self.recover_client(wsconn, frame)
 
         if not client:
             # create a HWSClient
@@ -272,9 +255,14 @@ class OSIFServer:
         response_frame.opcode = OSIFS_OP_REPLY
         response_frame.clientid = client.clientid
 
-        response_frame.set_options({**options, **client.options})
+        response_frame.set_options(
+            {**get_server_configuration_options(), **client.options}
+        )
 
         wsconn.send(response_frame.serialize())
+        logger.info(
+            f"client initialised, cid: {client.clientid:#x}, xid: {frame.transactionid:#x}"
+        )
 
     def handle_receive_fetch_clients(self, wsconn, frame):
         response_frame = OSIFSFrame(frame)
@@ -307,12 +295,19 @@ class OSIFServer:
                 client = self.clients[i]
                 break
         if not client:
+            logger.err(
+                f"handle packet cid: {frame.clientid:#x}, xid: {frame.transactionid:#x}"
+            )
             return
 
-        ethertype_ipv4 = 0x0800
+        logger.info(
+            f"received packet, ett: {frame.ethertype:#x}, cid: {frame.clientid:#x}, xid: {frame.transactionid:#x}"
+        )
 
+        ethertype_ipv4 = 0x0800
         if ethertype_ipv4 == frame.ethertype:
             client.output(frame.ethertype, frame.data, frame.transactionid)
+
 
     def handle_close(self, wsconn: wsserver.WSConn):
         # find client call teardown method and remove client from list
@@ -326,6 +321,7 @@ class OSIFServer:
                 i += 1
                 continue
 
+            logger.info(f"closing client, cid: {hex(self.clients[i].clientid)}")
             self.clients[i].close()
             self.clients.pop(i)
 
@@ -333,5 +329,5 @@ class OSIFServer:
 server = OSIFServer()
 ioengine_factory.start()
 
-print(OSIFServer.__name__, " Server running")
+logger.warn(OSIFServer.__name__ + " Server running")
 server.run()
