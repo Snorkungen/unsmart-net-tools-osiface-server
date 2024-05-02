@@ -15,13 +15,13 @@ class NATLease:
 
     source_saddr: ipaddress._IPAddressBase
     source_daddr: ipaddress._IPAddressBase
-    # source_sport: int
-    # source_dport: int
+    source_sport: int
+    source_dport: int
 
     target_saddr: ipaddress._IPAddressBase
     target_daddr: ipaddress._IPAddressBase
-    # source_sport: int
-    # source_dport: int
+    target_sport: int
+    target_dport: int
 
     def __init__(
         self,
@@ -31,6 +31,10 @@ class NATLease:
         target_saddr: ipaddress._IPAddressBase,
         target_daddr: ipaddress._IPAddressBase,
         proto=-1,
+        source_sport: int = -1,
+        source_dport: int = -1,
+        target_sport: int = -1,
+        target_dport: int = -1,
         clientid: int = None,
     ) -> None:
         self.expires = time.time() + lease_time
@@ -41,6 +45,11 @@ class NATLease:
         self.target_daddr = target_daddr
 
         self.proto = proto
+
+        self.source_sport = source_sport
+        self.source_dport = source_dport
+        self.target_sport = target_sport
+        self.target_dport = target_dport
 
         self.clientid = clientid
 
@@ -193,6 +202,8 @@ class NATManager:
         saddr: ipaddress._IPAddressBase,
         daddr: ipaddress._IPAddressBase,
         proto=-1,
+        sport: int = -1,
+        dport: int = -1,
         # start of kwargs
         clientid: int = None,
     ) -> Optional[NATLease]:
@@ -220,6 +231,16 @@ class NATManager:
                     target_saddr = _lease.target_saddr
                     break
 
+        """
+            For future pondering, is there actually a good reason as to why
+            target_saddr needs to be unique per transaction,
+            there would'nt be that large of a rework, if the discrimination
+            would be handled by the client.
+
+            I think the best option would be prefer to give each transaction a unique
+            target_saddr, but if that is not possible revert to then sharing addresses.
+        """
+
         if pool.empty():
             print(pool.used, "Pool is empty", pool.network)
             return None  # there should be some kind of recovery logic here
@@ -235,6 +256,11 @@ class NATManager:
             target_saddr,
             target_daddr,
             proto=proto,
+            # just for now just pass on the ports without any thought
+            source_sport=sport,
+            source_dport=dport,
+            target_sport=sport,
+            target_dport=dport,
             clientid=clientid,
         )
 
@@ -248,16 +274,21 @@ class NATManager:
             self.leases.append(newlease)
             return self.leases[-1]
 
+    # TODO: write a version of this method that returns all matching leases
     def get_lease(
         self,
         target_saddr: ipaddress._BaseAddress,
         target_daddr: ipaddress._BaseAddress,
         proto=-1,
+        target_sport: int = -1,
+        target_dport: int = -1,
     ):
         # NAT were to smarter request more information and do the checking
         for lease in self.leases:
             if (
                 (lease.proto < 0 or lease.proto == proto)
+                and (lease.target_sport < 0 or lease.target_sport == target_sport)
+                and (lease.target_dport < 0 or lease.target_dport == target_dport)
                 and lease.target_saddr == target_saddr
                 and lease.target_daddr == target_daddr
             ):
@@ -281,20 +312,34 @@ ETH_P_ALL = 0x3
 ETH_P_IP = 0x0800
 
 STRUCT_IPHDR_FORMAT = "!BBHHHBBHII"
+STRUCT_UPDHDR_FORMAT = "!HHHH"
 
 
 def read_datahdr(
     ethertype: int, data: bytes
-) -> Tuple[int, ipaddress._BaseAddress, ipaddress._BaseAddress]:
+) -> Tuple[
+    int, ipaddress._BaseAddress, ipaddress._BaseAddress, Optional[int], Optional[int]
+]:
+    offset = 0
     if ethertype == ETH_P_IP:
         values = struct.unpack(STRUCT_IPHDR_FORMAT, data[:20])
         proto = values[6]
         saddr = ipaddress.IPv4Address(values[8])
         daddr = ipaddress.IPv4Address(values[9])
+
+        offset = (values[0] & 0x0F) << 2
     else:
         raise ValueError
 
-    return (proto, saddr, daddr)
+    sport = -1
+    dport = -1
+
+    if proto == socket.IPPROTO_UDP:
+        values = struct.unpack_from(STRUCT_UPDHDR_FORMAT, data, offset)
+        sport = values[0]
+        dport = values[1]
+
+    return (proto, saddr, daddr, sport, dport)
 
 
 def replace_ip4address(
@@ -406,14 +451,13 @@ class RawIPv4IOEngine(IOEngine):
 
     def process_incoming2(self, b: bytes, addr):
         # read iphdr
-        proto, saddr, daddr = read_datahdr(addr[1], b)
+        proto, saddr, daddr, sport, dport = read_datahdr(addr[1], b)
         lease = self.natman.get_lease(
-            daddr, saddr, proto=proto
+            daddr, saddr, proto=proto, target_sport=dport, target_dport=sport
         )  # flipped because this is the receipt of a packet
 
         if not lease:
             return
-
 
         data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
 
@@ -423,14 +467,17 @@ class RawIPv4IOEngine(IOEngine):
                 continue
 
             transaction[1](addr[1], data)
-            
+
             # self.terminate_transaction(lease)
             """
                 How can the server close a transaction?
                 The IP addresses get exhausted really quickly,
                 which might not actually be a problem.
+
+                I rememebered the problem, if another transaction is establised
+                then the client could receive a duplicate response, which could be remedied
+                by tagging a received packet and limiting it to only be sent once per client
             """
-            
 
     def terminate_transaction(self, lease: NATLease):
         for i, transaction in enumerate(self.transactions):
@@ -453,9 +500,11 @@ class RawIPv4IOEngine(IOEngine):
             return
 
         # parse iphdr
-        proto, saddr, daddr = read_datahdr(ethertype, data)
+        proto, saddr, daddr, sport, dport = read_datahdr(ethertype, data)
         # obtain lease
-        lease = self.natman.lease(saddr, daddr, proto, clientid=clientid)
+        lease = self.natman.lease(
+            saddr, daddr, proto, sport=sport, dport=dport, clientid=clientid
+        )
 
         if not lease:
             logger.err(f"failed to send packet, no lease found for {daddr}")
@@ -494,18 +543,13 @@ class IOEngineFactory:
 
 
 if __name__ == "__main__":
-    natpool = NATAddressPool(ipaddress.IPv4Network("192.168.1.12/30"))
+    # fmt: off
+    iphdr = bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x45, 0x00,
+            0x00, 0x2c, 0x08, 0xe4, 0x40, 0x00, 0x40, 0x11, 0x33, 0xdb, 0x7f, 0x00, 0x00, 0x01, 0x7f, 0x00,
+            0x00, 0x01, 0x8a, 0xd7, 0x27, 0x1b, 0x00, 0x18, 0xfe, 0x2b, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
+            0x55, 0x44, 0x50, 0x20, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72
+        ])[14:]
 
-    print(natpool.pool, natpool.references)
-
-    a = natpool.pick(enforce_unique=False)
-    natpool.drop(a)
-    print(natpool.pool, natpool.references)
-
-    print(natpool.pick(enforce_unique=False))
-    print(natpool.pick(enforce_unique=False))
-    print(natpool.pick(enforce_unique=True))
-    print(natpool.pick(enforce_unique=False))
-    print(natpool.pick(enforce_unique=True))
-
-    print(natpool.pool, natpool.references)
+    values = read_datahdr(0x800, iphdr)
+    print(values)
