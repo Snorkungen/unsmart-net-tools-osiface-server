@@ -49,14 +49,20 @@ class NATAddressPool:
     MAX_SIZE = 10
 
     pool: list[ipaddress._BaseAddress]  # just pre-compute addresses in the beginning
-    used: set[int]  # associative array containing indices of the used addresses
+
+    references: list[int]
+    """
+    references is a one to one maping, the possible values for each index are:
+    0: address is unused free and available
+    -1: address is used and the picker requires the address is unique
+    1,2,3...: how many references there are for the address
+    """
+
     network: ipaddress.IPv4Network
 
     def __init__(self, network: ipaddress.IPv4Network) -> None:
         self.network = network
         self.pool = []
-        self.used = set()
-
         hosts = network.hosts()
 
         if isinstance(hosts, list):
@@ -69,24 +75,53 @@ class NATAddressPool:
                 except StopIteration:
                     break
 
-    def pick(self) -> ipaddress._BaseAddress:
+        self.references = [0] * len(self.pool)
+
+    def pick(self, enforce_unique=True) -> ipaddress._BaseAddress:
+        """Pick an address from the pool of available addresses
+
+        Args:
+            enforce_unique -- flag if the chosen address needs to be unique (default True)
+        """
         for idx in range(len(self.pool)):
-            if not idx in self.used:
-                self.used.add(idx)
+            reference_count = self.references[idx]
+            if (not enforce_unique and reference_count < 0) or (
+                enforce_unique and reference_count != 0
+            ):
+                continue
+            elif enforce_unique and reference_count == 0:
+                self.references[idx] = -1
                 return self.pool[idx]
+
+            # if not enforcing unique choose the first available
+
+            self.references[idx] += 1
+            return self.pool[idx]
         else:
-            raise "pool empty"
+            raise Exception("pool empty")
 
     def drop(self, address: ipaddress._BaseAddress):
-        for idx in range(len(self.pool)):
-            if self.pool[idx] == address and (
-                idx in self.used  # prevent KeyError
-            ):  # idk if this compares objects or actually compares the address
-                self.used.remove(idx)
-                return
+        """Drop a address from the pool, and make the address available for future use
 
-    def full(self) -> bool:
-        return len(self.used) >= len(self.pool)
+        Args:
+            address -- address to be dropped
+        """
+
+        for idx in range(len(self.pool)):
+            if self.pool[idx] != address:
+                continue
+            if self.references[idx] < 0:
+                self.references[idx] = 0
+            elif self.references[idx] > 0:
+                self.references[idx] -= 1
+
+    def empty(self, enforce_unique=True) -> bool:
+        try:
+            a = self.pick(enforce_unique=enforce_unique)
+            self.drop(a)
+            return False
+        except:
+            return True
 
 
 class NATManager:
@@ -185,8 +220,8 @@ class NATManager:
                     target_saddr = _lease.target_saddr
                     break
 
-        if pool.full():
-            print(pool.used, "Pool is full", pool.network)
+        if pool.empty():
+            print(pool.used, "Pool is empty", pool.network)
             return None  # there should be some kind of recovery logic here
 
         if not target_saddr:
@@ -433,6 +468,7 @@ class RawIPv4IOEngine(IOEngine):
 
         return lambda: self.terminate_transaction(lease)
 
+
 class IOEngineFactory:
     natman: NATManager
     useless_engine: IOEngine
@@ -455,24 +491,19 @@ class IOEngineFactory:
 
 
 if __name__ == "__main__":
-    natman = NATManager(
-        natmap={
-            ipaddress.IPv4Address("10.1.1.40"): ("127.1.1.1", "127.48.0.0/16"),
-            "10.1.1.4": ("192.168.1.201", "192.168.1.201"),
-        }
-    )
+    natpool = NATAddressPool(ipaddress.IPv4Network("192.168.1.12/30"))
 
-    lease = natman.lease(
-        ipaddress.IPv4Address("172.16.143.2"),
-        ipaddress.IPv4Address("10.1.1.4"),
-        proto=17,
-    )
-    print(lease.target_saddr, lease.target_daddr)
-    lease = natman.lease(
-        ipaddress.IPv4Address("172.16.143.2"),
-        ipaddress.IPv4Address("10.1.1.4"),
-        proto=-1,
-    )
-    print(lease)
+    print(natpool.pool, natpool.references)
 
-    print(natman.source_daddr_lookup_table[ipaddress.IPv4Address("10.1.1.40")][1])
+    a = natpool.pick(enforce_unique=False)
+    natpool.drop(a)
+    print(natpool.pool, natpool.references)
+
+    print(natpool.pick(enforce_unique=False))
+    print(natpool.pick(enforce_unique=False))
+    print(natpool.pick(enforce_unique=True))
+    print(natpool.pick(enforce_unique=False))
+    print(natpool.pick(enforce_unique=True))
+
+    print(natpool.pool, natpool.references)
+
