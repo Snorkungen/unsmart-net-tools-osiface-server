@@ -507,7 +507,7 @@ class RawIPv4IOEngine(IOEngine):
         )
 
         if not lease:
-            logger.err(f"failed to send packet, no lease found for {daddr}")
+            logger.err(f"failed to send packet, no NATLease found for {daddr}")
             return lambda: None  # no lease found, silently quit
 
         transaction = (lease, input)
@@ -516,6 +516,18 @@ class RawIPv4IOEngine(IOEngine):
         # output the packet but that is for another day.
 
         self.send_socket.sendto(data, (str(lease.target_daddr), 0))
+
+        for tl, _ in self.transactions:
+            if (
+                tl.clientid == lease.clientid
+                and tl.target_daddr == lease.target_daddr
+                and tl.target_saddr == lease.target_saddr
+                and tl.proto == lease.proto
+            ):
+                # Decreasing the chance of duplicate packets getting sent to the client
+                self.terminate_transaction(tl)    
+                break
+
         self.transactions.append(transaction)
 
         return lambda: self.terminate_transaction(lease)
