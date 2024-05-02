@@ -396,6 +396,15 @@ class RawIPv4IOEngine(IOEngine):
         if addr[2] == socket.PACKET_OUTGOING:
             return  # idk
 
+        # spin up another thread that to do the processing of the incoming packet
+        return threading.Thread(
+            None,
+            self.process_incoming2,
+            args=(b, addr),
+            daemon=True,
+        ).start()
+
+    def process_incoming2(self, b: bytes, addr):
         # read iphdr
         proto, saddr, daddr = read_datahdr(addr[1], b)
         lease = self.natman.get_lease(
@@ -405,19 +414,7 @@ class RawIPv4IOEngine(IOEngine):
         if not lease:
             return
 
-        # spin up another thread that then finishes the pro
-        return threading.Thread(
-            None,
-            self.process_incoming2,
-            args=(
-                b,
-                addr,
-                lease,
-            ),
-            daemon=True,
-        ).start()
 
-    def process_incoming2(self, b: bytes, addr, lease: NATLease):
         data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
 
         # get transaction
@@ -426,9 +423,14 @@ class RawIPv4IOEngine(IOEngine):
                 continue
 
             transaction[1](addr[1], data)
-            # just accept the fact that zombie transaction will exist untill the client terminates the transaction
-            # i do not know what i'm doing, it works but i do not like how it works
-            self.terminate_transaction(lease)
+            
+            # self.terminate_transaction(lease)
+            """
+                How can the server close a transaction?
+                The IP addresses get exhausted really quickly,
+                which might not actually be a problem.
+            """
+            
 
     def terminate_transaction(self, lease: NATLease):
         for i, transaction in enumerate(self.transactions):
@@ -507,4 +509,3 @@ if __name__ == "__main__":
     print(natpool.pick(enforce_unique=True))
 
     print(natpool.pool, natpool.references)
-

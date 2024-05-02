@@ -28,7 +28,7 @@ OSIFS_OP_REPLY = 2
 OSIFS_OP_FETCH_CLIENTS = 3
 OSIFS_OP_SEND_PACKET = 8
 
-natman = NATManager({"10.1.1.40": ("127.1.1.1", "127.48.0.0/16")})
+natman = NATManager({"10.1.1.40": ("127.0.0.1", "127.48.0.0/16")})
 ioengine_factory = IOEngineFactory(natman)
 
 
