@@ -166,7 +166,6 @@ class NATManager:
             self.source_daddr_lookup_table[source_daddr] = value
 
         self.leases = []
-        self.pool4 = NATAddressPool(ipaddress.IPv4Network("127.48.0.0/16"))
 
     @staticmethod
     def _create_source_daddr_lookup_table_value(
@@ -197,7 +196,7 @@ class NATManager:
 
         return source_daddr, (target_daddr, NATAddressPool(target_saddr_network))
 
-    def lease(
+    def create_lease(
         self,
         saddr: ipaddress._IPAddressBase,
         daddr: ipaddress._IPAddressBase,
@@ -220,16 +219,34 @@ class NATManager:
         if not daddr in self.source_daddr_lookup_table:
             return None  # failed to find the destination
 
-        current_time = time.time()
         target_saddr: ipaddress._BaseAddress = None
         target_daddr, pool = self.source_daddr_lookup_table[daddr]
 
-        # check if client already has a target_saddr
+        # first look if there already is a lease that is for the same client
+        # and has the same relevant details
         if clientid:
-            for _lease in self.leases:
-                if _lease.clientid == clientid:
-                    target_saddr = _lease.target_saddr
-                    break
+            for existing_lease in self.leases:
+                if existing_lease.clientid != clientid:
+                    continue
+                elif (
+                    # check that the source addresses are equal
+                    existing_lease.source_saddr == saddr
+                    and existing_lease.source_daddr == daddr
+                    # check that if proto set that they are equal
+                    # check the source port numbers
+                    and (existing_lease.proto < 0 or existing_lease.proto == proto)
+                    and (
+                        existing_lease.source_sport < 0
+                        or existing_lease.source_sport == sport
+                    )
+                    and (
+                        existing_lease.source_dport < 0
+                        or existing_lease.source_dport == dport
+                    )
+                ):
+                    # update expiry time
+                    existing_lease.expires += self.LEASE_TIME
+                    return existing_lease
 
         """
             For future pondering, is there actually a good reason as to why
@@ -246,15 +263,15 @@ class NATManager:
             return None  # there should be some kind of recovery logic here
 
         if not target_saddr:
-            target_saddr = pool.pick()
+            target_saddr = pool.pick(enforce_unique=True)
 
         # create lease
         newlease = NATLease(
-            NATManager.LEASE_TIME,
-            saddr,
-            daddr,
-            target_saddr,
-            target_daddr,
+            lease_time=NATManager.LEASE_TIME,
+            source_saddr=saddr,
+            source_daddr=daddr,
+            target_saddr=target_saddr,
+            target_daddr=target_daddr,
             proto=proto,
             # just for now just pass on the ports without any thought
             source_sport=sport,
@@ -264,18 +281,10 @@ class NATManager:
             clientid=clientid,
         )
 
-        for idx, _lease in enumerate(self.leases):
-            if _lease.expires < current_time:
-                # here the issue in what pool is this
-                self.remove(_lease, modify_leases=False)
-                self.leases[idx] = newlease
-                return self.leases[idx]
-        else:
-            self.leases.append(newlease)
-            return self.leases[-1]
+        self.leases.append(newlease)
+        return self.leases[-1]
 
-    # TODO: write a version of this method that returns all matching leases
-    def get_lease(
+    def get_matching_leases(
         self,
         target_saddr: ipaddress._BaseAddress,
         target_daddr: ipaddress._BaseAddress,
@@ -283,23 +292,32 @@ class NATManager:
         target_sport: int = -1,
         target_dport: int = -1,
     ):
-        # NAT were to smarter request more information and do the checking
-        for lease in self.leases:
+
+        for existing_lease in self.leases:
             if (
-                (lease.proto < 0 or lease.proto == proto)
-                and (lease.target_sport < 0 or lease.target_sport == target_sport)
-                and (lease.target_dport < 0 or lease.target_dport == target_dport)
-                and lease.target_saddr == target_saddr
-                and lease.target_daddr == target_daddr
+                # check that the source addresses are equal
+                existing_lease.target_saddr == target_saddr
+                and existing_lease.target_daddr == target_daddr
+                # check that if proto set that they are equal
+                # check the target port numbers
+                and (existing_lease.proto < 0 or existing_lease.proto == proto)
+                and (
+                    existing_lease.target_sport < 0
+                    or existing_lease.target_sport == target_sport
+                )
+                and (
+                    existing_lease.target_dport < 0
+                    or existing_lease.target_dport == target_dport
+                )
             ):
-                return lease
+                yield existing_lease
 
     def remove(self, lease: NATLease, modify_leases=True):
         # get the pool from the lookup table
         _, pool = self.source_daddr_lookup_table[lease.source_daddr]
         pool.drop(lease.target_saddr)
 
-        if modify_leases:
+        if modify_leases and lease in self.leases:
             self.leases.remove(lease)
 
 
@@ -392,9 +410,6 @@ class IOEngine:
         """This method gets called forever untill program ends"""
         pass
 
-    def terminate_transaction(self, ident: Any):
-        pass
-
     def output(
         self,
         ethertype: int,
@@ -413,7 +428,7 @@ class IOEngine:
 
 class RawIPv4IOEngine(IOEngine):
     natman: NATManager
-    transactions: list[Tuple[NATLease, Callable[[int, bytes], None]]]
+    transactions: list[Tuple[NATLease, Callable[[int, bytes], None]]] = []
 
     def __init__(self, natman: NATManager = None, self_start=True) -> None:
         self.natman = natman
@@ -452,39 +467,22 @@ class RawIPv4IOEngine(IOEngine):
     def process_incoming2(self, b: bytes, addr):
         # read iphdr
         proto, saddr, daddr, sport, dport = read_datahdr(addr[1], b)
-        lease = self.natman.get_lease(
-            daddr, saddr, proto=proto, target_sport=dport, target_dport=sport
-        )  # flipped because this is the receipt of a packet
 
-        if not lease:
-            return
+        for lease in self.natman.get_matching_leases(
+            target_saddr=daddr,
+            target_daddr=saddr,
+            proto=proto,
+            target_sport=dport,
+            target_dport=sport,
+        ):
+            # TODO: replace ports if they're defined
+            data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
 
-        data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
+            for transaction in self.transactions:
+                if transaction[0] != lease:
+                    continue
 
-        # get transaction
-        for transaction in self.transactions:
-            if transaction[0] != lease:
-                continue
-
-            transaction[1](addr[1], data)
-
-            # self.terminate_transaction(lease)
-            """
-                How can the server close a transaction?
-                The IP addresses get exhausted really quickly,
-                which might not actually be a problem.
-
-                I rememebered the problem, if another transaction is establised
-                then the client could receive a duplicate response, which could be remedied
-                by tagging a received packet and limiting it to only be sent once per client
-            """
-
-    def terminate_transaction(self, lease: NATLease):
-        for i, transaction in enumerate(self.transactions):
-            if transaction[0] == lease:
-                self.transactions.pop(i)
-                self.natman.remove(lease)
-                return
+                transaction[1](addr[1], data)
 
     def output(
         self,
@@ -502,7 +500,7 @@ class RawIPv4IOEngine(IOEngine):
         # parse iphdr
         proto, saddr, daddr, sport, dport = read_datahdr(ethertype, data)
         # obtain lease
-        lease = self.natman.lease(
+        lease = self.natman.create_lease(
             saddr, daddr, proto, sport=sport, dport=dport, clientid=clientid
         )
 
@@ -510,27 +508,36 @@ class RawIPv4IOEngine(IOEngine):
             logger.err(f"failed to send packet, no NATLease found for {daddr}")
             return lambda: None  # no lease found, silently quit
 
-        transaction = (lease, input)
+        self.transaction_add(lease, input)
 
         data = replace_ip4address(data, lease.target_saddr, lease.target_daddr)
-        # output the packet but that is for another day.
-
         self.send_socket.sendto(data, (str(lease.target_daddr), 0))
 
-        for tl, _ in self.transactions:
+        return lambda: self.transaction_remove(lease)
+
+    def transaction_add(self, lease: NATLease, input: Callable[[int, bytes], None]):
+        # okay here the goal is to have as few transactions as possible
+
+        for idx, transaction in enumerate(self.transactions):
             if (
-                tl.clientid == lease.clientid
-                and tl.target_daddr == lease.target_daddr
-                and tl.target_saddr == lease.target_saddr
-                and tl.proto == lease.proto
-            ):
-                # Decreasing the chance of duplicate packets getting sent to the client
-                self.terminate_transaction(tl)    
-                break
+                lease != transaction[0]
+            ):  # it is the natmans responsibility to reduce the number of leases created
+                continue
 
-        self.transactions.append(transaction)
+            # update input function otherwise return
+            self.transactions[idx] = (lease, input)
+            return
 
-        return lambda: self.terminate_transaction(lease)
+        self.transactions.append((lease, input))
+
+    def transaction_remove(self, lease: NATLease):
+        # NOTE: an issue is that when the OSIFSClient closes
+        # it calls this function for every output it has created
+        # not actually a serious problem, so ignore for now
+        for i, transaction in enumerate(self.transactions):
+            if transaction[0] == lease:
+                self.transactions.pop(i)
+                self.natman.remove(lease)
 
 
 class IOEngineFactory:
