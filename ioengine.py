@@ -7,7 +7,9 @@ import threading
 from typing import Any, Callable, Optional, Tuple, Union
 
 import platform
+
 assert platform.system() == "Linux", "This program only supports linux socket API"
+
 
 class NATLease:
     expires: int  # when lease should be removed
@@ -137,7 +139,9 @@ class NATAddressPool:
 
 class NATManager:
     LEASE_TIME = 40  # 40 seconds
+
     leases: list[NATLease]
+    source_port: int
 
     def __init__(
         self,
@@ -149,6 +153,7 @@ class NATManager:
         ] = {},
     ) -> None:
         self.leases = []
+        self.source_port = 1800
 
         # just use a map
         self.source_daddr_lookup_table: dict[
@@ -221,7 +226,7 @@ class NATManager:
         if not daddr in self.source_daddr_lookup_table:
             return None  # failed to find the destination
 
-        target_saddr: ipaddress._BaseAddress = None
+        target_saddr: ipaddress._BaseAddress
         target_daddr, pool = self.source_daddr_lookup_table[daddr]
 
         # first look if there already is a lease that is for the same client
@@ -260,11 +265,22 @@ class NATManager:
             target_saddr, but if that is not possible revert to then sharing addresses.
         """
 
-        if pool.empty():
-            print(pool.used, "Pool is empty", pool.network)
-            return None  # there should be some kind of recovery logic here
+        target_sport = sport
+
+        if proto > 0 and sport > 0 and dport > 0:
+            # Now the lease is responsible for and can touch the mess with the "sport"
+
+            # get a target source address i.e. the address that the output is going to use
+            target_saddr = pool.pick(enforce_unique=False)
+            # get a sport number
+            self.source_port += 1
+            target_sport = self.source_port
 
         if not target_saddr:
+            if pool.empty():
+                print(pool.used, "Pool is empty", pool.network)
+                return None  # there should be some kind of recovery logic here
+
             target_saddr = pool.pick(enforce_unique=True)
 
         # create lease
@@ -278,7 +294,7 @@ class NATManager:
             # just for now just pass on the ports without any thought
             source_sport=sport,
             source_dport=dport,
-            target_sport=sport,
+            target_sport=target_sport,
             target_dport=dport,
             clientid=clientid,
         )
@@ -331,6 +347,7 @@ class NATManager:
 ETH_P_ALL = 0x3
 ETH_P_IP = 0x0800
 
+STRUCT_IP_PSEUDOHDR_FORMAT = "!IIBBH"
 STRUCT_IPHDR_FORMAT = "!BBHHHBBHII"
 STRUCT_UPDHDR_FORMAT = "!HHHH"
 
@@ -380,6 +397,39 @@ def replace_ip4address(
     )
 
     return bytes(data)
+
+
+def replace_udp4_info(data: bytes, offset: int, sport: int, dport: int) -> bytearray:
+    data = bytearray(data)
+
+    # read the udp header
+    udp_values = struct.unpack_from(STRUCT_UPDHDR_FORMAT, data, offset)
+    udp_values = list(udp_values)
+
+    udp_values[0] = sport  # replace the source port
+    udp_values[1] = dport  # replace the source port
+    udp_values[3] = 0  # set the checksum field to zero
+
+    # write into the udp header some values
+    struct.pack_into(STRUCT_UPDHDR_FORMAT, data, offset, *udp_values)
+
+    proto, saddr, daddr, *_ = read_datahdr(ETH_P_IP, data)
+    # create pseudo header
+    pseudo_header = struct.pack(
+        STRUCT_IP_PSEUDOHDR_FORMAT,
+        int(daddr),
+        int(saddr),
+        0,
+        proto,
+        udp_values[2],  # the udp header lenght
+    )
+    csum = calculate_checksum(
+        bytes([*pseudo_header, *data[offset : offset + udp_values[2]]])
+    )
+    # write the calculated checksum into the data
+    struct.pack_into("!H", data, offset + 6, (csum or 0xFFFF))
+
+    return data
 
 
 # TODO: circumvent the fact that the loopback routine does not play nice with raw ip sockets
@@ -477,8 +527,19 @@ class RawIPv4IOEngine(IOEngine):
             target_sport=dport,
             target_dport=sport,
         ):
-            # TODO: replace ports if they're defined
             data = replace_ip4address(b, lease.source_daddr, lease.source_saddr)
+
+            # TODO: replace ports if they're defined
+            # modify the incoming packet data
+            if lease.proto > 0 and lease.target_sport > 0 and lease.target_dport > 0:
+                if lease.proto == socket.IPPROTO_UDP:
+                    udp_begin = (
+                        data[0] & 0xF
+                    ) << 2  # assume the ip header is the first thing so read the offset, and assume it is correct
+
+                    data = replace_udp4_info(
+                        data, udp_begin, lease.source_sport, lease.source_dport
+                    )
 
             for transaction in self.transactions:
                 if transaction[0] != lease:
@@ -513,6 +574,19 @@ class RawIPv4IOEngine(IOEngine):
         self.transaction_add(lease, input)
 
         data = replace_ip4address(data, lease.target_saddr, lease.target_daddr)
+
+        if lease.proto > 0 and lease.target_sport > 0 and lease.target_dport > 0:
+            # do some additional processing for the outgoing packet
+
+            if lease.proto == socket.IPPROTO_UDP:
+                udp_begin = (
+                    data[0] & 0xF
+                ) << 2  # assume the ip header is the first thing so read the offset, and assume it is correct
+
+                data = replace_udp4_info(
+                    data, udp_begin, lease.target_sport, lease.target_dport
+                )
+
         self.send_socket.sendto(data, (str(lease.target_daddr), 0))
 
         return lambda: self.transaction_remove(lease)

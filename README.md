@@ -20,3 +20,13 @@ The client being the OSInterface object that operating in the browser. Would fir
 
 When registering a client the server, the server assigns a unique client id, that it expects to receive from future communication with the client. When the server receives a request to forward a packet the server, translates the IP addresses of the received packet, to a address pair that is native to the local network. Furthermore the server the forwards the packet, through the operating system, and the listens for a response/responses to the forwarded packet. If the server receives a response to a forwarded packet, then the server would forward the received packet to the registered client, using the established WebSocket connection.
 
+## Get Started
+
+1. Download code.
+2. configure NATMan - osifaceserver.py
+3. run osifaceserver.py as root
+
+```sh
+# run as root
+python ./osifaceserver.py
+```
