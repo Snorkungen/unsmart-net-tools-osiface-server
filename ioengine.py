@@ -6,6 +6,8 @@ from utils import *
 import threading
 from typing import Any, Callable, Optional, Tuple, Union
 
+import platform
+assert platform.system() == "Linux", "This program only supports linux socket API"
 
 class NATLease:
     expires: int  # when lease should be removed
