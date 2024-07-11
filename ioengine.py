@@ -538,7 +538,7 @@ class RawIPv4IOEngine(IOEngine):
                     ) << 2  # assume the ip header is the first thing so read the offset, and assume it is correct
 
                     data = replace_udp4_info(
-                        data, udp_begin, lease.source_sport, lease.source_dport
+                        data, udp_begin, lease.source_dport, lease.source_sport
                     )
 
             for transaction in self.transactions:
