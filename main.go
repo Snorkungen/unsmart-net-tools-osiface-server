@@ -14,6 +14,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// TODOs
+// [ ] Refactor messaging between WS-client and WS-server
+// [ ] Rework NATMan the adding of source destination objects are a bit whacky
+// Refactor entire program and structure the logic and structures and naming
+
 // implementation stolen from somewhere can't remember from where
 // https://www.rfc-editor.org/rfc/rfc1071.txt 4.1 (has a similar taste)
 func calculate_checksum(buf []byte) uint16 {
@@ -48,10 +53,6 @@ func calculate_checksum(buf []byte) uint16 {
 	return uint16(sum & 0xFFFF)
 }
 
-/********************************/
-/* NATMan & transaction logic */
-/********************************/
-
 const (
 	ETH_IP = 0x0800
 )
@@ -69,12 +70,12 @@ var (
 			string([]byte{10, 1, 1, 40}): {
 				target_daddr: []byte{127, 0, 0, 1},
 				target_saddr: []byte{127, 48, 0, 1},
-				port:         1800,
+				port:         30000,
 			},
 			string([]byte{127, 0, 0, 1}): {
 				target_daddr: []byte{127, 0, 0, 1},
 				target_saddr: []byte{127, 48, 0, 1},
-				port:         1800,
+				port:         30000,
 			},
 		},
 	}
@@ -333,8 +334,6 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 
 		checksum := calculate_checksum(tmp)
 
-		fmt.Printf("Cheksum %#x\n", checksum)
-
 		// set the udp checksum
 		binary.BigEndian.PutUint16((*data)[offset+6:], checksum)
 
@@ -591,12 +590,6 @@ func main() {
 	var counter Counter
 	counter.Set(0)
 
-	type s_raw_data struct {
-		Type uint16
-		Data []byte
-	}
-	data_channel := make(chan s_raw_data, 6)
-
 	sending4_socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		sending4_socket = -1
@@ -605,16 +598,11 @@ func main() {
 	listening_socket, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(syscall.ETH_P_IP)))
 	if err == nil {
 		/* Listen to the OS incoming packets */
-		go func(out chan s_raw_data) {
-			if err != nil {
-				log.Fatal(err)
-
-				return
-			}
-			buffer := make([]byte, 1600)
-
+		go func() {
 			for {
-				len, from, err := syscall.Recvfrom(listening_socket, buffer, 0)
+				// A fun thing could be creating a free-list of buffers
+				buffer := make([]byte, 1600)
+				data_len, from, err := syscall.Recvfrom(listening_socket, buffer, 0)
 
 				if err != nil {
 					continue
@@ -622,37 +610,43 @@ func main() {
 
 				sa := from.(*syscall.SockaddrLinklayer)
 
-				out <- s_raw_data{
-					ntohs(sa.Protocol),
-					buffer[0:len],
-				}
-			}
+				// Nah man just spin up another thread, thread pool maybe ???
+				// Yes! this allows me to overengineer this, by for example creating a pool routines that have qeues of packets awating processing
+				go func(ethertype uint16, data bucket) {
+					matches := match_received_packet_with_transaction(uint(ethertype), data)
 
-		}(data_channel)
-
-		/* Receive packets & forward to the clients */
-		go func(in chan s_raw_data) {
-			for data := range data_channel {
-				matches := match_received_packet_with_transaction(uint(data.Type), data.Data)
-
-				if len(matches) == 0 {
-					continue
-				}
-
-				for _, t := range matches {
-					// overwrite the data with for each match because the processing function do not read the data
-					err := Transaction_in_process(*t, (*bucket)(&data.Data))
-
-					if err != nil {
-						continue
+					if len(matches) == 0 {
+						return
 					}
 
-					// forward the thing for the specific transaction
-					// i.e. the client probably contains a channel that the does stuff
-					// t.Client // do stuff
-				}
+					for _, t := range matches {
+						// overwrite the data with for each match because the processing function do not read the data
+						err := Transaction_in_process(*t, &data)
+
+						if err != nil {
+							continue
+						}
+
+						buf := make(bucket, OSIFS_HEADER_LENGTH+len(data))
+						binary.Write(buf, binary.BigEndian, &OSIFSHeader{
+							Version:   OSIFS_VERSION,
+							Opcode:    OSIFS_OP_SEND_PACKET,
+							Cid:       uint32(t.Client.id),
+							Xid:       0, // SEND_PACKET does not require a transaction id
+							Ethertype: ethertype,
+						})
+
+						// copy packet data
+						copy(buf[OSIFS_HEADER_LENGTH:], data)
+
+						fmt.Println(t.Client)
+
+						// forward the packet to the client
+						t.Client.conn.WriteMessage(websocket.BinaryMessage, buf)
+					}
+				}(ntohs(sa.Protocol), buffer[:data_len])
 			}
-		}(data_channel)
+		}()
 	}
 
 	var upgrader websocket.Upgrader
@@ -778,26 +772,7 @@ func main() {
 				}
 
 			}
-
-			// fmt.Println("Type:", tpe, "Data:", data)
 		}
-
-		/*
-			I am going to require some kind of abstraction on top of this that then reads meassages
-		*/
-
-		// 	conn.
-
-		// 	fmt.Println("Websocket connection established")
-
-		// 	// can i keep the connection alive even after the function exits
-
-		// 	/* KEEP CONNECTION OPEN */
-
-		// 	/*
-		// 		Now the goal would be to do something interesting i guess
-		// 	*/
-
 	})
 
 	/* start http server */
