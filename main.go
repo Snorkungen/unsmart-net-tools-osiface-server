@@ -3,19 +3,19 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"github.com/gorilla/websocket"
 )
 
 // TODOs
-// [ ] Refactor messaging between WS-client and WS-server
+// [/] Refactor messaging between WS-client and WS-server, some abstraction
 // [ ] Rework NATMan the adding of source destination objects are a bit whacky
 // Refactor entire program and structure the logic and structures and naming
 
@@ -80,28 +80,6 @@ var (
 		},
 	}
 )
-
-type Counter struct {
-	mutex sync.Locker
-	count int
-}
-
-func (counter *Counter) Set(n int) {
-	if counter.mutex == nil {
-		counter.mutex = &sync.Mutex{}
-		counter.count = n
-		return
-	}
-
-	counter.mutex.Lock()
-	counter.count = n
-	counter.mutex.Unlock()
-}
-func (counter *Counter) Increment(n int) {
-	counter.mutex.Lock()
-	counter.count += n
-	counter.mutex.Unlock()
-}
 
 type bucket []byte
 
@@ -205,10 +183,43 @@ func (clnt *client) Close() {
 		return
 	}
 
-	clnt.Close()
+	clnt.conn.Close() // close ws-socket connection
 	clnt.conn = nil
 	clnt.transactions = clnt.transactions[0:0]
 
+}
+
+func (clnt *client) send(op uint16, ethertype uint16, xid uint32, message []byte) {
+	hdr := OSIFSHeader{
+		Version:   OSIFS_VERSION,
+		Opcode:    op,
+		Cid:       uint32(clnt.id),
+		Xid:       xid,
+		Ethertype: ethertype,
+	}
+
+	msg_len := OSIFS_HEADER_LENGTH + len(message)
+	msg_data := make(bucket, msg_len)
+
+	binary.Write(msg_data, binary.BigEndian, &hdr) // write header into send buffer
+	copy(msg_data[OSIFS_HEADER_LENGTH:], message)  // copy message into send buffer
+
+	clnt.conn.WriteMessage(websocket.BinaryMessage, msg_data) // Send msg to ws-client
+}
+
+// Server can only send packets and replies
+func (clnt *client) SendPacket(ethertype uint16, message []byte) {
+	clnt.send(OSIFS_OP_SEND_PACKET, ethertype, 0, message)
+}
+
+func (clnt *client) SendReply(xid uint32, reply any) {
+	message, err := json.Marshal(reply)
+	if err != nil {
+		log.Fatal("Could not send: ", reply)
+		return // this should not fail
+	}
+
+	clnt.send(OSIFS_OP_REPLY, 0, xid, message)
 }
 
 type transaction struct {
@@ -587,8 +598,6 @@ func ntohs(i uint16) uint16 {
 
 func main() {
 	addr := "0.0.0.0:7000"
-	var counter Counter
-	counter.Set(0)
 
 	sending4_socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
@@ -627,22 +636,8 @@ func main() {
 							continue
 						}
 
-						buf := make(bucket, OSIFS_HEADER_LENGTH+len(data))
-						binary.Write(buf, binary.BigEndian, &OSIFSHeader{
-							Version:   OSIFS_VERSION,
-							Opcode:    OSIFS_OP_SEND_PACKET,
-							Cid:       uint32(t.Client.id),
-							Xid:       0, // SEND_PACKET does not require a transaction id
-							Ethertype: ethertype,
-						})
-
-						// copy packet data
-						copy(buf[OSIFS_HEADER_LENGTH:], data)
-
-						fmt.Println(t.Client)
-
-						// forward the packet to the client
-						t.Client.conn.WriteMessage(websocket.BinaryMessage, buf)
+						// Forward packet to client
+						t.Client.SendPacket(ethertype, data)
 					}
 				}(ntohs(sa.Protocol), buffer[:data_len])
 			}
@@ -700,10 +695,9 @@ func main() {
 			case OSIFS_OP_INIT:
 				{
 					// handle initialize the client
-					// handwave away there should be some options but they're no supported by this version of the server
-					counter.Increment(1)
+
 					clients = append(clients, client{
-						id:           counter.count,
+						id:           len(clients) + 1, // the client id only needs to be unique for each websocket connection
 						conn:         conn,
 						transactions: make([]*transaction, 0),
 					})
@@ -711,18 +705,7 @@ func main() {
 					client := clients[len(clients)-1]
 
 					// this is wher it would be good to have a abstraction that does the reading and logic that i require
-					hdr := OSIFSHeader{
-						Version: OSIFS_VERSION,
-						Opcode:  OSIFS_OP_REPLY,
-						Cid:     uint32(client.id),
-						Xid:     hdr.Xid,
-					}
-
-					// reply
-					msg_data := make(bucket, unsafe.Sizeof(hdr))
-					binary.Write(msg_data, binary.BigEndian, &hdr)
-
-					conn.WriteMessage(websocket.BinaryMessage, msg_data)
+					client.SendReply(hdr.Xid, struct{}{}) // client expects at least {} return value to be an object, although In EcmaScript everything is an object
 
 					continue ws_message_read_loop
 				}
