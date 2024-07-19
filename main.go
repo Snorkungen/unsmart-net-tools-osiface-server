@@ -77,65 +77,6 @@ type OSIFSHeader struct {
 	Ethertype uint16 // IPv4 (0x800)
 }
 
-// basically just a wrapper for the Websocket connection that allows me to create methods
-// create a wrapper for the thing that creates method for reading the binary message format
-
-type client struct {
-	// some reference to the ws connection
-	conn         *websocket.Conn
-	transactions []*transaction
-	id           int
-
-	// some reference to the open transactions
-}
-
-func (clnt *client) Close() {
-	// issue a marker that the transactions are about to close
-	ioengine.ReleaseClient(clnt)
-
-	if clnt.conn == nil {
-		return
-	}
-
-	clnt.conn.Close() // close ws-socket connection
-	clnt.conn = nil
-	clnt.transactions = clnt.transactions[0:0]
-
-}
-
-func (clnt *client) send(op uint16, ethertype uint16, xid uint32, message []byte) {
-	hdr := OSIFSHeader{
-		Version:   OSIFS_VERSION,
-		Opcode:    op,
-		Cid:       uint32(clnt.id),
-		Xid:       xid,
-		Ethertype: ethertype,
-	}
-
-	msg_len := OSIFS_HEADER_LENGTH + len(message)
-	msg_data := make(bucket, msg_len)
-
-	binary.Write(msg_data, binary.BigEndian, &hdr) // write header into send buffer
-	copy(msg_data[OSIFS_HEADER_LENGTH:], message)  // copy message into send buffer
-
-	clnt.conn.WriteMessage(websocket.BinaryMessage, msg_data) // Send msg to ws-client
-}
-
-// Server can only send packets and replies
-func (clnt *client) SendPacket(ethertype uint16, message []byte) {
-	clnt.send(OSIFS_OP_SEND_PACKET, ethertype, 0, message)
-}
-
-func (clnt *client) SendReply(xid uint32, reply any) {
-	message, err := json.Marshal(reply)
-	if err != nil {
-		log.Fatal("Could not send: ", reply)
-		return // this should not fail
-	}
-
-	clnt.send(OSIFS_OP_REPLY, 0, xid, message)
-}
-
 type transaction struct {
 	Client *client
 
@@ -675,6 +616,61 @@ func (engine *IOEngine) SetDestination(str_sdaddr string, str_tsource string, st
 	}
 }
 
+// basically just a wrapper for the Websocket connection that allows me to create methods
+// create a wrapper for the thing that creates method for reading the binary message format
+type client struct {
+	// some reference to the ws connection
+	conn *websocket.Conn
+	id   int
+
+	// some reference to the open transactions
+}
+
+func (clnt *client) Close() {
+	// issue a marker that the transactions are about to close
+	ioengine.ReleaseClient(clnt)
+
+	if clnt.conn == nil {
+		return
+	}
+
+	clnt.conn.Close() // close ws-socket connection
+	clnt.conn = nil
+}
+
+func (clnt *client) send(op uint16, ethertype uint16, xid uint32, message []byte) {
+	hdr := OSIFSHeader{
+		Version:   OSIFS_VERSION,
+		Opcode:    op,
+		Cid:       uint32(clnt.id),
+		Xid:       xid,
+		Ethertype: ethertype,
+	}
+
+	msg_len := OSIFS_HEADER_LENGTH + len(message)
+	msg_data := make(bucket, msg_len)
+
+	binary.Write(msg_data, binary.BigEndian, &hdr) // write header into send buffer
+	copy(msg_data[OSIFS_HEADER_LENGTH:], message)  // copy message into send buffer
+
+	clnt.conn.WriteMessage(websocket.BinaryMessage, msg_data) // Send msg to ws-client
+}
+
+// Server can only send packets and replies
+func (clnt *client) SendPacket(ethertype uint16, message []byte) {
+	clnt.send(OSIFS_OP_SEND_PACKET, ethertype, 0, message)
+}
+
+func (clnt *client) SendReply(xid uint32, reply any) {
+	message, err := json.Marshal(reply)
+	if err != nil {
+		log.Fatal("Could not send: ", reply)
+		return // this should not fail
+	}
+
+	clnt.send(OSIFS_OP_REPLY, 0, xid, message)
+}
+
 // WS_client state machine stuff
 type WSClientHandler struct {
 	conn    *websocket.Conn
@@ -717,9 +713,8 @@ func (wsch *WSClientHandler) Handle(data bucket, r *http.Request) {
 
 func (wsch *WSClientHandler) HandleInit(hdr OSIFSHeader, _ bucket) {
 	wsch.clients = append(wsch.clients, client{
-		id:           len(wsch.clients) + 1, // the client id only needs to be unique for each websocket connection
-		conn:         wsch.conn,
-		transactions: make([]*transaction, 0),
+		id:   len(wsch.clients) + 1, // the client id only needs to be unique for each websocket connection
+		conn: wsch.conn,
 	})
 
 	client := wsch.clients[len(wsch.clients)-1]
