@@ -20,6 +20,7 @@ import (
 // Refactor entire program and structure the logic and structures and naming
 
 var (
+	ioengine           = IOEngine{}
 	transactions       []transaction
 	transactions_mutex sync.RWMutex
 
@@ -528,53 +529,176 @@ func Transaction_in_process(trans transaction, data *bucket) error {
 	return err
 }
 
+// TODO: integrate natman into ioengine
+// Begin of recreating the ioengine monstrosity
+type IOEngine struct {
+	listening_socket int
+	sending_socket4  int
+}
+
+func (engine *IOEngine) SendPacket(client client, ethertype uint, packet_data bucket) error {
+	if ethertype != syscall.ETH_P_IP {
+		return fmt.Errorf("ethertype(%#x) not supported", ethertype)
+	}
+
+	if engine.sending_socket4 <= 0 {
+		return fmt.Errorf("no sending_socket4 socket")
+	}
+
+	// do the actual packet processing, where the client is needed and stuff
+	t, err := Transaction_open(client, ethertype, packet_data)
+	if err != nil {
+		return err
+	}
+
+	// set the requisite fields for the outgoing packet
+	Transaction_out_process(t, &packet_data)
+
+	// create destination socket address
+	sa := syscall.SockaddrInet4{
+		Port: 0,
+		Addr: [4]byte(t.Target_daddr),
+	}
+
+	err = syscall.Sendto(engine.sending_socket4, packet_data, 0, &sa)
+	return err
+}
+
+func (engine *IOEngine) ReceiveAndForward() error {
+	// A fun thing could be creating a free-list of buffers
+	buffer := make([]byte, 1600)
+	data_len, from, err := syscall.Recvfrom(engine.listening_socket, buffer, 0)
+
+	if err != nil {
+		return err
+	}
+
+	sa := from.(*syscall.SockaddrLinklayer)
+
+	// Nah man just spin up another thread, thread pool maybe ???
+	// Yes! this allows me to overengineer this, by for example creating a pool routines that have qeues of packets awating processing
+	go func(ethertype uint16, data bucket) {
+		matches := match_received_packet_with_transaction(uint(ethertype), data)
+
+		if len(matches) == 0 {
+			return
+		}
+
+		for _, t := range matches {
+			// overwrite the data with for each match because the processing function do not read the data
+			err := Transaction_in_process(*t, &data)
+
+			if err != nil {
+				continue
+			}
+
+			// Forward packet to client
+			t.Client.SendPacket(ethertype, data)
+		}
+	}(ntohs(sa.Protocol), buffer[:data_len])
+
+	return nil
+}
+
+func (engine *IOEngine) StartListening() {
+	if engine.listening_socket < 0 {
+		return
+	}
+
+	// start listening
+	go func() {
+		for {
+			engine.ReceiveAndForward()
+		}
+	}()
+}
+
+func (engine *IOEngine) Init() {
+	var err error
+
+	engine.listening_socket, err = syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(syscall.ETH_P_IP)))
+
+	if err != nil {
+		engine.listening_socket = -1 // there was a problem indicate that the there is a problem with the listening
+	}
+
+	engine.sending_socket4, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+
+	if err != nil {
+		engine.sending_socket4 = -1
+	}
+}
+
+// WS_client state machine stuff
+type WSClientHandler struct {
+	conn    *websocket.Conn
+	clients []client
+}
+
+func (wsch WSClientHandler) get_client_by_id(cid int) *client {
+	for i := range wsch.clients {
+		if cid == wsch.clients[i].id {
+			return &wsch.clients[i]
+		}
+	}
+
+	return nil
+}
+
+func (wsch *WSClientHandler) HandleClose(_ int, _ string) error {
+	for i := range wsch.clients {
+		wsch.clients[i].Close() // loop through and cleanup stuff
+	}
+
+	return nil
+}
+
+func (wsch *WSClientHandler) Handle(data bucket, r *http.Request) {
+	var hdr = OSIFSHeader{}
+	binary.Read(bucket(data), binary.BigEndian, &hdr)
+
+	switch hdr.Opcode {
+	case OSIFS_OP_INIT:
+		log.Printf("message from %s, initializing client", r.RemoteAddr)
+		wsch.HandleInit(hdr, data)
+	case OSIFS_OP_SEND_PACKET:
+		log.Printf("message from %s, received packet forwarding to os", r.RemoteAddr)
+		wsch.HandleSendPacket(hdr, data)
+	default:
+		log.Printf("message from %s, unknown op(%#x), cid(%#x)", r.RemoteAddr, hdr.Opcode, hdr.Cid)
+	}
+}
+
+func (wsch *WSClientHandler) HandleInit(hdr OSIFSHeader, _ bucket) {
+	wsch.clients = append(wsch.clients, client{
+		id:           len(wsch.clients) + 1, // the client id only needs to be unique for each websocket connection
+		conn:         wsch.conn,
+		transactions: make([]*transaction, 0),
+	})
+
+	client := wsch.clients[len(wsch.clients)-1]
+
+	// this is wher it would be good to have a abstraction that does the reading and logic that i require
+	client.SendReply(hdr.Xid, struct{}{}) // client expects at least {} return value to be an object, although In EcmaScript everything is an object
+}
+
+func (wsch *WSClientHandler) HandleSendPacket(hdr OSIFSHeader, data bucket) {
+	client := wsch.get_client_by_id(int(hdr.Cid))
+	if client == nil {
+		return
+	}
+
+	packet_data := data[OSIFS_HEADER_LENGTH:]
+
+	ioengine.SendPacket((*client), uint(hdr.Ethertype), packet_data)
+}
+
 func main() {
 	addr := "0.0.0.0:7000"
 
-	sending4_socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-	if err != nil {
-		sending4_socket = -1
-	}
-
-	listening_socket, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(syscall.ETH_P_IP)))
-	if err == nil {
-		/* Listen to the OS incoming packets */
-		go func() {
-			for {
-				// A fun thing could be creating a free-list of buffers
-				buffer := make([]byte, 1600)
-				data_len, from, err := syscall.Recvfrom(listening_socket, buffer, 0)
-
-				if err != nil {
-					continue
-				}
-
-				sa := from.(*syscall.SockaddrLinklayer)
-
-				// Nah man just spin up another thread, thread pool maybe ???
-				// Yes! this allows me to overengineer this, by for example creating a pool routines that have qeues of packets awating processing
-				go func(ethertype uint16, data bucket) {
-					matches := match_received_packet_with_transaction(uint(ethertype), data)
-
-					if len(matches) == 0 {
-						return
-					}
-
-					for _, t := range matches {
-						// overwrite the data with for each match because the processing function do not read the data
-						err := Transaction_in_process(*t, &data)
-
-						if err != nil {
-							continue
-						}
-
-						// Forward packet to client
-						t.Client.SendPacket(ethertype, data)
-					}
-				}(ntohs(sa.Protocol), buffer[:data_len])
-			}
-		}()
-	}
+	// configure and start ioengine
+	ioengine.Init()
+	ioengine.StartListening()
 
 	var upgrader websocket.Upgrader
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
@@ -587,106 +711,29 @@ func main() {
 			return
 		}
 
-		log.Println("Connection opened")
-
 		// It would be nice if this connection would be attached to some kind of global context
+		var handler = WSClientHandler{
+			conn:    conn,
+			clients: make([]client, 0, 1),
+		}
 
-		// this thing has to contain the place all the logic for the instance of the wsconnection
-		var clients []client = make([]client, 0)
-		var hdr OSIFSHeader
+		// set the  close callback, TODO: tell the below loop to stop reading
+		conn.SetCloseHandler(handler.HandleClose)
 
-		conn.SetCloseHandler(func(code int, text string) error {
-			log.Println("Connection closed")
+		log.Printf("connection opened with %s", r.RemoteAddr)
 
-			for i := range clients {
-				clients[i].Close() // loop through and cleanup stuff
-			}
-
-			return nil
-		})
-
-	ws_message_read_loop:
 		for {
-			tpe, data, err := conn.ReadMessage()
+			tpe, data, err := handler.conn.ReadMessage()
+
 			if err != nil {
 				break
 			}
 
 			if tpe != websocket.BinaryMessage {
-				continue
+				continue // bad received message ignore
 			}
 
-			hdr = OSIFSHeader{}
-			binary.Read(bucket(data), binary.BigEndian, &hdr)
-
-			if hdr.Version != OSIFS_VERSION {
-				continue // version mismatch
-			}
-
-			switch hdr.Opcode {
-			case OSIFS_OP_INIT:
-				{
-					// handle initialize the client
-
-					clients = append(clients, client{
-						id:           len(clients) + 1, // the client id only needs to be unique for each websocket connection
-						conn:         conn,
-						transactions: make([]*transaction, 0),
-					})
-
-					client := clients[len(clients)-1]
-
-					// this is wher it would be good to have a abstraction that does the reading and logic that i require
-					client.SendReply(hdr.Xid, struct{}{}) // client expects at least {} return value to be an object, although In EcmaScript everything is an object
-
-					continue ws_message_read_loop
-				}
-			case OSIFS_OP_SEND_PACKET:
-				{
-					if hdr.Ethertype == syscall.ETH_P_IP && sending4_socket < 0 {
-						continue ws_message_read_loop // no working sending socket
-					}
-					// receive packet i.e. forward packet to through the os
-
-					// get the associated client
-					var client client
-					for i := range clients {
-						if hdr.Cid == uint32(clients[i].id) {
-							client = clients[i]
-							break
-						}
-					}
-
-					if client.id == 0 {
-						// associated client not found
-						continue ws_message_read_loop
-					}
-
-					packet_data := bucket(data[OSIFS_HEADER_LENGTH:])
-
-					t, err := Transaction_open(client, uint(hdr.Ethertype), packet_data)
-					if err != nil {
-						// respond with error maybe
-						log.Fatal(err)
-						continue ws_message_read_loop
-					}
-
-					Transaction_out_process(t, &packet_data)
-
-					if t.Type == syscall.ETH_P_IP && sending4_socket > 0 {
-						sa := syscall.SockaddrInet4{
-							Port: 0,
-							Addr: [4]byte(t.Target_daddr),
-						}
-						err := syscall.Sendto(sending4_socket, packet_data, 0, &sa)
-						if err != nil {
-							log.Fatal(err)
-							continue ws_message_read_loop
-						}
-					}
-				}
-
-			}
+			handler.Handle(data, r)
 		}
 	})
 
