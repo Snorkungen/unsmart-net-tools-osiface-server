@@ -14,32 +14,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// TODOs
-// [/] Refactor messaging between WS-client and WS-server, some abstraction
-// [ ] Rework NATMan the adding of source destination objects are a bit whacky
-// Refactor entire program and structure the logic and structures and naming
-
 var (
 	ioengine = IOEngine{}
-
-	natman NATMan = NATMan{
-		map[string]struct {
-			target_daddr net.IP
-			target_saddr net.IP
-			port         uint16
-		}{
-			string([]byte{10, 1, 1, 40}): {
-				target_daddr: []byte{127, 0, 0, 1},
-				target_saddr: []byte{127, 48, 0, 1},
-				port:         30000,
-			},
-			string([]byte{127, 0, 0, 1}): {
-				target_daddr: []byte{127, 0, 0, 1},
-				target_saddr: []byte{127, 48, 0, 1},
-				port:         30000,
-			},
-		},
-	}
 )
 
 type UDPHeader struct {
@@ -181,18 +157,18 @@ type transaction struct {
 	references int // a reference count that does stuff i guess
 }
 
+type natman_lookup_entry struct {
+	target_daddr net.IP
+	target_saddr net.IP
+	port         uint16
+}
 type NATMan struct {
 	// fields that would have some kind of meaning etc...
-
-	source_destination_lookup map[string]struct {
-		target_daddr net.IP
-		target_saddr net.IP
-		port         uint16
-	}
+	source_destination_lookup map[string]natman_lookup_entry
 }
 
-func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr net.IP, target_sport uint16, err error) {
-	sourcer, isused := nm.source_destination_lookup[string(destination)]
+func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr []byte, target_sport uint16, err error) {
+	sourcer, isused := nm.source_destination_lookup[destination.String()]
 
 	// TODO: this should actually lock because different threads can touch this memory at once
 
@@ -200,18 +176,29 @@ func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr net.IP, ta
 		return target_saddr, target_daddr, target_sport, fmt.Errorf("destination not found")
 	}
 
-	target_saddr = make(net.IP, len(destination))
-	target_daddr = make(net.IP, len(destination))
+	target_saddr = make(net.IP, len(sourcer.target_saddr))
+	target_daddr = make(net.IP, len(sourcer.target_daddr))
 
-	// TODO: get a target source address from a selection of multiple choices maybe ???
-	copy(target_saddr, sourcer.target_saddr)
-
-	copy(target_daddr, sourcer.target_daddr)
-
-	// then sourcer would contain information that would allow the thing to operate and
+	// detect the network family
+	if tmp := destination.To4(); tmp != nil {
+		// addres is ipv4
+		target_saddr = make([]byte, net.IPv4len)
+		copy(target_saddr, sourcer.target_saddr.To4())
+		target_daddr = make([]byte, net.IPv4len)
+		copy(target_daddr, sourcer.target_daddr.To4())
+	} else {
+		// address is ipv6
+		target_saddr = make([]byte, net.IPv6len)
+		copy(target_saddr, sourcer.target_saddr.To16())
+		target_daddr = make([]byte, net.IPv6len)
+		copy(target_daddr, sourcer.target_daddr.To16())
+	}
 
 	sourcer.port += 1
 	target_sport = sourcer.port
+
+	// just copy over the updated values into the lookup table
+	nm.source_destination_lookup[destination.String()] = sourcer
 
 	return target_saddr, target_daddr, target_sport, nil
 }
@@ -348,13 +335,13 @@ func read_packet_data(ethertype uint, data bucket) (saddr, daddr []byte, protoco
 	return saddr, daddr, protocol, sport, dport
 }
 
-// TODO: integrate natman into ioengine
 // Begin of recreating the ioengine monstrosity
 type IOEngine struct {
 	listening_socket   int
 	sending_socket4    int
 	transactions       []transaction
 	transactions_mutex sync.RWMutex
+	natman             NATMan
 }
 
 // remove all references to client int transactions
@@ -491,7 +478,7 @@ func (engine *IOEngine) transaction_open(client *client, ethertype uint, data bu
 
 	// configure the address and port translations
 	// create some stateful object that keeps track of stuff, and does stuff
-	target_saddr, target_daddr, target_sport, err := natman.Get(daddr)
+	target_saddr, target_daddr, target_sport, err := engine.natman.Get(daddr)
 	if err != nil {
 		return nil, err
 	}
@@ -642,6 +629,50 @@ func (engine *IOEngine) Init() {
 	// initialize transactions stuff
 	engine.transactions = make([]transaction, 0)
 	engine.transactions_mutex = sync.RWMutex{}
+
+	// initialize natman
+	if engine.natman.source_destination_lookup == nil {
+		engine.natman.source_destination_lookup = make(map[string]natman_lookup_entry)
+	}
+}
+
+func (engine *IOEngine) SetDestination(str_sdaddr string, str_tsource string, str_tdestination string) {
+	var (
+		source_daddr net.IP
+		target_daddr net.IP
+		target_saddr net.IP
+	)
+
+	source_daddr = net.ParseIP(str_sdaddr)
+	if source_daddr == nil {
+		log.Fatal("bad source destination,", str_sdaddr)
+	}
+
+	target_daddr = net.ParseIP(str_tdestination)
+	if target_daddr == nil {
+		log.Fatal("bad target destination,", str_tdestination)
+	}
+
+	// !TODO: support target source be a network
+	target_saddr = net.ParseIP(str_tsource)
+	if target_saddr == nil {
+		log.Fatal("bad target source,", str_tsource)
+	}
+
+	if len(source_daddr) != len(target_saddr) || len(source_daddr) != len(target_daddr) {
+		log.Fatal("ip mismatch")
+		return
+	}
+
+	engine.natman.source_destination_lookup[(source_daddr).String()] = struct {
+		target_daddr net.IP
+		target_saddr net.IP
+		port         uint16
+	}{
+		target_daddr: target_daddr,
+		target_saddr: target_saddr,
+		port:         29900, // arbitrary number to begin port incrementation
+	}
 }
 
 // WS_client state machine stuff
@@ -713,6 +744,7 @@ func main() {
 
 	// configure and start ioengine
 	ioengine.Init()
+	ioengine.SetDestination("10.1.1.40", "127.48.0.1", "127.0.0.1")
 	ioengine.StartListening()
 
 	var upgrader websocket.Upgrader
