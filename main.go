@@ -19,45 +19,6 @@ import (
 // [ ] Rework NATMan the adding of source destination objects are a bit whacky
 // Refactor entire program and structure the logic and structures and naming
 
-// Checksum implementation inspired by <https://datatracker.ietf.org/doc/html/rfc1071#section-4.1>
-func calculate_checksum(buf []byte) uint16 {
-	var sum uint32 = 0
-
-	for i := 0; i < len(buf)-1; i += 2 {
-		sum += uint32((uint16(buf[i]) << 8) | uint16(buf[i+1]))
-	}
-
-	// If the number of bytes was odd, add the last byte
-	if len(buf)&1 != 0 {
-		sum += (uint32(buf[len(buf)-1])) << 8
-	}
-
-	// fold 32-bit sum to 16 bits
-	for sum>>16 > 0 { // same thing as sum & 0xFFFF0000 > 0
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-
-	return uint16(^sum)
-}
-
-// add to two checsums togheter, ONLY WORKS if csum1 was derrived from a byte array with a size that is divisble by 2
-func concat_checksum(csum1 uint16, csum2 uint16) uint16 {
-	var sum uint32 = uint32(csum1) + uint32(csum2)
-	if sum>>16 > 0 { // something about a carry bit
-		sum = (sum & 0xffff) + 1
-	}
-
-	if sum == 0xFFFF {
-		return 0
-	}
-
-	return uint16(sum)
-}
-
-const (
-	ETH_IP = 0x0800
-)
-
 var (
 	transactions       []transaction
 	transactions_mutex sync.RWMutex
@@ -81,17 +42,6 @@ var (
 		},
 	}
 )
-
-type bucket []byte
-
-func (b bucket) Read(p []byte) (int, error) {
-	copy(p, b)
-	return len(b), nil
-}
-func (b bucket) Write(p []byte) (int, error) {
-	copy(b, p)
-	return len(p), nil
-}
 
 type UDPHeader struct {
 	Sport    uint16
@@ -149,7 +99,7 @@ type OSIFSHeader struct {
 	Opcode    uint16 // INIT(0x1), REPLY(0x2), SEND_PACKET(0x8)
 	Cid       uint32
 	Xid       uint32
-	Ethertype uint16 // ETH_IP (0x800)
+	Ethertype uint16 // IPv4 (0x800)
 }
 
 // basically just a wrapper for the Websocket connection that allows me to create methods
@@ -378,7 +328,7 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 
 func read_packet_data(ethertype uint, data bucket) (saddr, daddr []byte, protocol int, sport, dport int) {
 	var offset int = 0
-	if ethertype == ETH_IP {
+	if ethertype == syscall.ETH_P_IP {
 		var hdr IPv4Header
 		binary.Read(data, binary.BigEndian, &hdr)
 
@@ -542,7 +492,7 @@ func Transaction_open(client client, ethertype uint, data bucket) (*transaction,
 func Transaction_out_process(trans *transaction, data *bucket) error {
 	var err error
 
-	if trans.Type == ETH_IP {
+	if trans.Type == syscall.ETH_P_IP {
 		err = replace_routing_information_ip4(data,
 			[4]byte(trans.Target_saddr),
 			[4]byte(trans.Target_daddr),
@@ -563,7 +513,7 @@ func Transaction_in_process(trans transaction, data *bucket) error {
 
 	/* Note that the for incoming packets the source and destination are swapped*/
 
-	if trans.Type == ETH_IP {
+	if trans.Type == syscall.ETH_P_IP {
 		err = replace_routing_information_ip4(data,
 			[4]byte(trans.Source_daddr),
 			[4]byte(trans.Source_saddr),
@@ -576,20 +526,6 @@ func Transaction_in_process(trans transaction, data *bucket) error {
 	}
 
 	return err
-}
-
-// host to short
-func htons(i uint16) uint16 {
-	b := make([]byte, 2)
-	binary.LittleEndian.PutUint16(b, (i))
-	return binary.BigEndian.Uint16(b)
-}
-
-// net to host short
-func ntohs(i uint16) uint16 {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, i)
-	return binary.LittleEndian.Uint16(b)
 }
 
 func main() {
@@ -707,7 +643,7 @@ func main() {
 				}
 			case OSIFS_OP_SEND_PACKET:
 				{
-					if hdr.Ethertype == ETH_IP && sending4_socket < 0 {
+					if hdr.Ethertype == syscall.ETH_P_IP && sending4_socket < 0 {
 						continue ws_message_read_loop // no working sending socket
 					}
 					// receive packet i.e. forward packet to through the os
@@ -737,7 +673,7 @@ func main() {
 
 					Transaction_out_process(t, &packet_data)
 
-					if t.Type == ETH_IP && sending4_socket > 0 {
+					if t.Type == syscall.ETH_P_IP && sending4_socket > 0 {
 						sa := syscall.SockaddrInet4{
 							Port: 0,
 							Addr: [4]byte(t.Target_daddr),
@@ -759,29 +695,4 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func main__() {
-	buffer := bucket{
-		0, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x45, 0x00,
-		0x00, 0x3c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x3c, 0xba, 0x7f, 0x00, 0x00, 0x01, 0x7f, 0x00,
-		0x00, 0x01, 0x10, 0xc1, 0xc8, 0xb4, 0x8f, 0x53, 0x13, 0x0a, 0x02, 0x60, 0xae, 0xec, 0xa0, 0x12,
-		0xff, 0xcb, 0xfe, 0x30, 0x00, 0x00, 0x02, 0x04, 0xff, 0xd7, 0x04, 0x02, 0x08, 0x0a, 0x70, 0xa2,
-		0xe7, 0x2e, 0x70, 0xa2, 0xe7, 0x2e, 0x01, 0x03, 0x03, 0x07, 0x70,
-	}
-
-	fmt.Println(calculate_checksum(buffer))
-
-	// binary.Write(bucket(ip_data[20:]), binary.BigEndian, &UDPHeader{Sport: 100, Dport: 6000})
-
-	// t, err := Transaction_open(client{}, ETH_IP, ip_data)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// 	return
-	// }
-
-	// fmt.Println(t, t == &transactions[0])
-
-	// // fmt.Println("Version", hdr.Version(), "HeaderLength", hdr.HeaderLength(), "saddr", hdr.Saddr)
-	// fmt.Println()
 }
