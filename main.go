@@ -20,9 +20,7 @@ import (
 // Refactor entire program and structure the logic and structures and naming
 
 var (
-	ioengine           = IOEngine{}
-	transactions       []transaction
-	transactions_mutex sync.RWMutex
+	ioengine = IOEngine{}
 
 	natman NATMan = NATMan{
 		map[string]struct {
@@ -117,19 +115,7 @@ type client struct {
 
 func (clnt *client) Close() {
 	// issue a marker that the transactions are about to close
-
-	// this is dangerous territory because the client contains a slice of pointers to the global transactions
-	{
-		transactions_mutex.Lock()
-
-		var none_client client
-		for _, ptr := range clnt.transactions {
-			(*ptr).references = 0       // set the reference count to zero so the next time someone opens the transaction get's deleted
-			(*ptr).Client = none_client // just incase so nothing dumb happens if the ws connection is closed
-		}
-
-		transactions_mutex.Unlock()
-	}
+	ioengine.ReleaseClient(clnt)
 
 	if clnt.conn == nil {
 		return
@@ -175,7 +161,7 @@ func (clnt *client) SendReply(xid uint32, reply any) {
 }
 
 type transaction struct {
-	Client client
+	Client *client
 
 	Type  int // An enum for the type ether type i.e IP version
 	Proto int // An enum for the upper layer protocol type
@@ -362,16 +348,48 @@ func read_packet_data(ethertype uint, data bucket) (saddr, daddr []byte, protoco
 	return saddr, daddr, protocol, sport, dport
 }
 
-func match_received_packet_with_transaction(ethertype uint, data bucket) (matched_transactions []*transaction) {
+// TODO: integrate natman into ioengine
+// Begin of recreating the ioengine monstrosity
+type IOEngine struct {
+	listening_socket   int
+	sending_socket4    int
+	transactions       []transaction
+	transactions_mutex sync.RWMutex
+}
+
+// remove all references to client int transactions
+func (engine *IOEngine) ReleaseClient(client *client) {
+	engine.transactions_mutex.Lock()
+
+	// remove transactions with client from transactions
+	for i := 0; i < len(engine.transactions); i++ {
+		if engine.transactions[i].Client != client {
+			continue
+		}
+
+		engine.transactions[i].references = 0
+		engine.transactions[i].Client = nil
+
+		// remove transaction from list
+		engine.transactions[i] = engine.transactions[len(engine.transactions)-1] // swap last with current
+		engine.transactions = engine.transactions[:len(engine.transactions)-1]   // remove the last from list
+
+		i -= 1 // decrement idx due to transaction now being smaller
+	}
+
+	engine.transactions_mutex.Unlock()
+}
+
+func (engine *IOEngine) match_received_packet_with_transaction(ethertype uint, data bucket) (matched_transactions []*transaction) {
 	saddr, daddr, protocol, sport, dport := read_packet_data((ethertype), data)
 
 	/* Read transactions and find the requisite transactions*/
-	transactions_mutex.RLock()
-	defer transactions_mutex.RUnlock()
+	engine.transactions_mutex.RLock()
+	defer engine.transactions_mutex.RUnlock()
 
-	matched_transactions = make([]*transaction, 0, len(transactions))
+	matched_transactions = make([]*transaction, 0, len(engine.transactions))
 
-	for i, transaction := range transactions {
+	for i, transaction := range engine.transactions {
 		if ethertype != uint(transaction.Type) {
 			continue // not a match
 		}
@@ -399,25 +417,24 @@ func match_received_packet_with_transaction(ethertype uint, data bucket) (matche
 		/* So what now do we do with the transactions */
 
 		/* now do the same magic where the data in the packet is modified and other stuff */
-		matched_transactions = append(matched_transactions, &transactions[i])
+		matched_transactions = append(matched_transactions, &engine.transactions[i])
 	}
 
 	return matched_transactions
 }
 
-/* read the packet data and create a transaction structure and allows the user to do stuff, if open transaction exist reuse the same transactions */
-// either returns the an existing transaction or creates a new transaction
-func Transaction_open(client client, ethertype uint, data bucket) (*transaction, error) {
+// Create or reuse a transaction for a packet going to the operating system
+func (engine *IOEngine) transaction_open(client *client, ethertype uint, data bucket) (*transaction, error) {
 	saddr, daddr, protocol, sport, dport := read_packet_data((ethertype), data)
 	/* determine if there is already an existing transaction from the same thing */
 
 	// there is a problem as to how does the thing that needs the transaction
 	// reference count
-	transactions_mutex.Lock()
-	defer transactions_mutex.Unlock()
+	engine.transactions_mutex.Lock()
+	defer engine.transactions_mutex.Unlock()
 
-	for i := 0; i < len(transactions); i++ {
-		transaction := transactions[i]
+	for i := 0; i < len(engine.transactions); i++ {
+		transaction := engine.transactions[i]
 
 		if transaction.references == 0 {
 			// this has been marked to be removed, no one should be using this transaction
@@ -425,15 +442,15 @@ func Transaction_open(client client, ethertype uint, data bucket) (*transaction,
 
 			// how does this work
 			// <https://stackoverflow.com/a/37335777>
-			transactions[i] = transactions[len(transactions)-1]
-			transactions = transactions[:len(transactions)-1]
+			engine.transactions[i] = engine.transactions[len(engine.transactions)-1]
+			engine.transactions = engine.transactions[:len(engine.transactions)-1]
 
 			i -= 1 // since an element has ben removed then the slice gets removed
 			continue
 		}
 
 		// TODO: a better understanding of what does the comparison of client mean
-		if transaction.Client.conn != client.conn || transaction.Client.id != client.id {
+		if transaction.Client != client {
 			continue // client does not match
 		}
 
@@ -454,9 +471,9 @@ func Transaction_open(client client, ethertype uint, data bucket) (*transaction,
 		}
 
 		// have not figured out what this means because when a client closes the transactions should close, but there might be a case when the transaction should get deleted but the client does'nt exist
-		transactions[i].references += 1
+		engine.transactions[i].references += 1
 
-		return &transactions[i], nil
+		return &engine.transactions[i], nil
 	}
 
 	var transaction transaction
@@ -484,32 +501,13 @@ func Transaction_open(client client, ethertype uint, data bucket) (*transaction,
 	transaction.Target_sport = int(target_sport)
 	transaction.Target_dport = dport
 
-	transactions = append(transactions, transaction)
+	engine.transactions = append(engine.transactions, transaction)
 
-	return &transactions[len(transactions)-1], nil
+	return &engine.transactions[len(engine.transactions)-1], nil
 }
 
-/* modify the fileds of the data  */
-func Transaction_out_process(trans *transaction, data *bucket) error {
-	var err error
-
-	if trans.Type == syscall.ETH_P_IP {
-		err = replace_routing_information_ip4(data,
-			[4]byte(trans.Target_saddr),
-			[4]byte(trans.Target_daddr),
-			uint8(trans.Proto),
-			uint16(trans.Target_sport),
-			uint16(trans.Target_dport),
-		)
-
-	} else {
-		return fmt.Errorf("unsupported transaction type")
-	}
-
-	return err
-}
-
-func Transaction_in_process(trans transaction, data *bucket) error {
+// modify the fields of the packet data for packets coming from the OS
+func (engine *IOEngine) transaction_in_process(trans transaction, data *bucket) error {
 	var err error
 
 	/* Note that the for incoming packets the source and destination are swapped*/
@@ -529,14 +527,27 @@ func Transaction_in_process(trans transaction, data *bucket) error {
 	return err
 }
 
-// TODO: integrate natman into ioengine
-// Begin of recreating the ioengine monstrosity
-type IOEngine struct {
-	listening_socket int
-	sending_socket4  int
+// modify the fields of the packet data for packets going to the OS
+func (engine *IOEngine) transaction_out_process(trans transaction, data *bucket) error {
+	var err error
+
+	if trans.Type == syscall.ETH_P_IP {
+		err = replace_routing_information_ip4(data,
+			[4]byte(trans.Target_saddr),
+			[4]byte(trans.Target_daddr),
+			uint8(trans.Proto),
+			uint16(trans.Target_sport),
+			uint16(trans.Target_dport),
+		)
+
+	} else {
+		return fmt.Errorf("unsupported transaction type")
+	}
+
+	return err
 }
 
-func (engine *IOEngine) SendPacket(client client, ethertype uint, packet_data bucket) error {
+func (engine *IOEngine) SendPacket(client *client, ethertype uint, packet_data bucket) error {
 	if ethertype != syscall.ETH_P_IP {
 		return fmt.Errorf("ethertype(%#x) not supported", ethertype)
 	}
@@ -546,13 +557,13 @@ func (engine *IOEngine) SendPacket(client client, ethertype uint, packet_data bu
 	}
 
 	// do the actual packet processing, where the client is needed and stuff
-	t, err := Transaction_open(client, ethertype, packet_data)
+	t, err := engine.transaction_open(client, ethertype, packet_data)
 	if err != nil {
 		return err
 	}
 
 	// set the requisite fields for the outgoing packet
-	Transaction_out_process(t, &packet_data)
+	engine.transaction_out_process(*t, &packet_data)
 
 	// create destination socket address
 	sa := syscall.SockaddrInet4{
@@ -578,7 +589,7 @@ func (engine *IOEngine) ReceiveAndForward() error {
 	// Nah man just spin up another thread, thread pool maybe ???
 	// Yes! this allows me to overengineer this, by for example creating a pool routines that have qeues of packets awating processing
 	go func(ethertype uint16, data bucket) {
-		matches := match_received_packet_with_transaction(uint(ethertype), data)
+		matches := engine.match_received_packet_with_transaction(uint(ethertype), data)
 
 		if len(matches) == 0 {
 			return
@@ -586,7 +597,7 @@ func (engine *IOEngine) ReceiveAndForward() error {
 
 		for _, t := range matches {
 			// overwrite the data with for each match because the processing function do not read the data
-			err := Transaction_in_process(*t, &data)
+			err := engine.transaction_in_process(*t, &data)
 
 			if err != nil {
 				continue
@@ -627,6 +638,10 @@ func (engine *IOEngine) Init() {
 	if err != nil {
 		engine.sending_socket4 = -1
 	}
+
+	// initialize transactions stuff
+	engine.transactions = make([]transaction, 0)
+	engine.transactions_mutex = sync.RWMutex{}
 }
 
 // WS_client state machine stuff
@@ -690,7 +705,7 @@ func (wsch *WSClientHandler) HandleSendPacket(hdr OSIFSHeader, data bucket) {
 
 	packet_data := data[OSIFS_HEADER_LENGTH:]
 
-	ioengine.SendPacket((*client), uint(hdr.Ethertype), packet_data)
+	ioengine.SendPacket(client, uint(hdr.Ethertype), packet_data)
 }
 
 func main() {
