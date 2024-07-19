@@ -19,38 +19,39 @@ import (
 // [ ] Rework NATMan the adding of source destination objects are a bit whacky
 // Refactor entire program and structure the logic and structures and naming
 
-// implementation stolen from somewhere can't remember from where
-// https://www.rfc-editor.org/rfc/rfc1071.txt 4.1 (has a similar taste)
+// Checksum implementation inspired by <https://datatracker.ietf.org/doc/html/rfc1071#section-4.1>
 func calculate_checksum(buf []byte) uint16 {
 	var sum uint32 = 0
-	var data uint16
 
-	var count = len(buf)
-	var i = 0
-
-	for count > 1 {
-		data = (uint16(buf[i]) << 8 & 0xFF00) | (uint16(buf[i+1]) & 0xFF)
-		sum += uint32(data)
-
-		if (sum & 0xFFFF0000) > 0 {
-			sum = sum & 0xFFFF
-			sum += 1
-		}
-
-		i += 2
-		count -= 2
+	for i := 0; i < len(buf)-1; i += 2 {
+		sum += uint32((uint16(buf[i]) << 8) | uint16(buf[i+1]))
 	}
 
-	if count > 0 {
-		sum += (uint32(buf[i]) << 8) & 0xFF00
-		if (sum & 0xFFFF0000) > 0 {
-			sum = sum & 0xFFFF
-			sum += 1
-		}
+	// If the number of bytes was odd, add the last byte
+	if len(buf)&1 != 0 {
+		sum += (uint32(buf[len(buf)-1])) << 8
 	}
 
-	sum = ^sum
-	return uint16(sum & 0xFFFF)
+	// fold 32-bit sum to 16 bits
+	for sum>>16 > 0 { // same thing as sum & 0xFFFF0000 > 0
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	return uint16(^sum)
+}
+
+// add to two checsums togheter, ONLY WORKS if csum1 was derrived from a byte array with a size that is divisble by 2
+func concat_checksum(csum1 uint16, csum2 uint16) uint16 {
+	var sum uint32 = uint32(csum1) + uint32(csum2)
+	if sum>>16 > 0 { // something about a carry bit
+		sum = (sum & 0xffff) + 1
+	}
+
+	if sum == 0xFFFF {
+		return 0
+	}
+
+	return uint16(sum)
 }
 
 const (
@@ -320,6 +321,11 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 		return fmt.Errorf("not supported reading icmp errors")
 	}
 
+	tmp := make(bucket, pseudohdr_size)
+	binary.Write((tmp), binary.BigEndian, &pseudohdr)
+
+	var psuedohdr_csum = calculate_checksum((tmp)) // pseudohdr size is a multiple of 16-bits
+
 	if hdr.Protocol == syscall.IPPROTO_UDP {
 		// read udp header
 		var udphdr UDPHeader
@@ -338,12 +344,8 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 		// write the udp data onto the data
 		binary.Write((*data)[offset:], binary.BigEndian, &udphdr)
 
-		// write the pseudohdr into a buffer so the checksum can be calculated
-		tmp := make(bucket, pseudohdr_size+int(udphdr.Length))
-		binary.Write((tmp), binary.BigEndian, &pseudohdr)
-		copy(tmp[pseudohdr_size:], (*data)[offset:hdr.TotalLength])
-
-		checksum := calculate_checksum(tmp)
+		// concatenate the checsum of the pseudohdr data and the udp header data
+		checksum := concat_checksum(psuedohdr_csum, calculate_checksum((*data)[offset:]))
 
 		// set the udp checksum
 		binary.BigEndian.PutUint16((*data)[offset+6:], checksum)
@@ -362,17 +364,11 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 		// reset the checsum
 		tcphdr.Checksum = 0
 
-		// write the udp data onto the data
+		// write the tcp header data onto the data
 		binary.Write((*data)[offset:], binary.BigEndian, &tcphdr)
 
 		// write the pseudohdr into a buffer so the checksum can be calculated
-
-		// write the pseudohdr into a buffer so the checksum can be calculated
-		tmp := make(bucket, pseudohdr_size+int(hdr.TotalLength)-offset)
-		binary.Write((tmp), binary.BigEndian, &pseudohdr)
-		copy(tmp[pseudohdr_size:], (*data)[offset:hdr.TotalLength])
-
-		checksum := calculate_checksum(tmp)
+		checksum := concat_checksum(psuedohdr_csum, calculate_checksum((*data)[offset:hdr.TotalLength]))
 		// set the tcp checksum
 		binary.BigEndian.PutUint16((*data)[offset+6:], checksum)
 	}
@@ -766,14 +762,15 @@ func main() {
 }
 
 func main__() {
-	ip_data := bucket{
-		0x45, 0x00,
-		0x00, 0x2c, 0x08, 0xe4, 0x40, 0x00, 0x40, 0x11, 0x33, 0xdb, 0x7f, 0x00, 0x00, 0x01, 0x7f, 0x00,
-		0x00, 0x01, 0x8a, 0xd7, 0x27, 0x1b, 0x00, 0x18, 0xd4, 0x36, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
-		0x55, 0x44, 0x50, 0x20, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72,
+	buffer := bucket{
+		0, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x45, 0x00,
+		0x00, 0x3c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x3c, 0xba, 0x7f, 0x00, 0x00, 0x01, 0x7f, 0x00,
+		0x00, 0x01, 0x10, 0xc1, 0xc8, 0xb4, 0x8f, 0x53, 0x13, 0x0a, 0x02, 0x60, 0xae, 0xec, 0xa0, 0x12,
+		0xff, 0xcb, 0xfe, 0x30, 0x00, 0x00, 0x02, 0x04, 0xff, 0xd7, 0x04, 0x02, 0x08, 0x0a, 0x70, 0xa2,
+		0xe7, 0x2e, 0x70, 0xa2, 0xe7, 0x2e, 0x01, 0x03, 0x03, 0x07, 0x70,
 	}
 
-	fmt.Println(calculate_checksum(ip_data))
+	fmt.Println(calculate_checksum(buffer))
 
 	// binary.Write(bucket(ip_data[20:]), binary.BigEndian, &UDPHeader{Sport: 100, Dport: 6000})
 
