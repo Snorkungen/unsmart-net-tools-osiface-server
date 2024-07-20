@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"github.com/gorilla/websocket"
 )
@@ -29,6 +30,12 @@ type TCPHeader struct {
 	Sport    uint16
 	Dport    uint16
 	_        [12]byte // contains fields that are not needed for nat ops
+	Checksum uint16
+}
+
+type ICMPHeader struct {
+	Type     uint8
+	Code     uint8
 	Checksum uint16
 }
 
@@ -144,7 +151,7 @@ func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr []byte, ta
 	return target_saddr, target_daddr, target_sport, nil
 }
 
-func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte, protocol uint8, sport uint16, dport uint16) error {
+func replace_routing_information_ip4(data bucket, saddr [4]byte, daddr [4]byte, protocol uint8, sport uint16, dport uint16) error {
 	var offset int = 0
 
 	/* Read IP Header */
@@ -169,8 +176,8 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 	}
 
 	// recalculate and set the new checksum
-	checksum := calculate_checksum((*data)[0:offset])
-	binary.BigEndian.PutUint16((*data)[10:], checksum)
+	checksum := calculate_checksum(data[0:offset])
+	binary.BigEndian.PutUint16(data[int(unsafe.Offsetof(hdr.Checksum)):], checksum)
 
 	var pseudohdr PseudoIPv4Header
 	var pseudohdr_size = 12
@@ -181,9 +188,38 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 	/* this thing could cause a problem but we're fine right */
 	pseudohdr.Length = hdr.TotalLength - uint16(hdr.HeaderLength())
 
-	if protocol != hdr.Protocol {
-		// if the packet is not an icmp error the quit
-		return fmt.Errorf("not supported reading icmp errors")
+	if hdr.Protocol == syscall.IPPROTO_ICMP {
+		/* create an attempt at handling packets */
+
+		// read icmp header
+		var icmphdr ICMPHeader
+		binary.Read(data[offset:], binary.BigEndian, &icmphdr)
+
+		switch icmphdr.Type {
+		case 0:
+		case 8:
+			{
+			} // noop
+		case 3: // Handle destination unreachable
+			{
+				// recursive call, +"4" is unused header field
+				replace_routing_information_ip4(data[offset+int(unsafe.Sizeof(icmphdr))+4:], saddr, daddr, protocol, sport, dport)
+
+				// recalculate, icmp header checsum
+				binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(icmphdr.Checksum)):], 0) // set the checksum field to zero
+
+				// write the checksum value into the icmp checksum field
+				checksum := calculate_checksum(data[offset:])
+				binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(icmphdr.Checksum)):], checksum) // I do not like magic numbers
+			}
+		default:
+			{
+				// if type is not explicitly handled the the type should not be forwarded Either way
+				return fmt.Errorf("ICMP(4) type: %d not handled", icmphdr.Type)
+			}
+		}
+	} else if protocol != hdr.Protocol {
+		return fmt.Errorf("protocol does match header protocol")
 	}
 
 	tmp := make(bucket, pseudohdr_size)
@@ -194,7 +230,7 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 	if hdr.Protocol == syscall.IPPROTO_UDP {
 		// read udp header
 		var udphdr UDPHeader
-		binary.Read((*data)[offset:], binary.BigEndian, &udphdr)
+		binary.Read(data[offset:], binary.BigEndian, &udphdr)
 
 		pseudohdr.Length = udphdr.Length
 		pseudohdr.Protocol = syscall.IPPROTO_UDP
@@ -207,18 +243,17 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 		udphdr.Checksum = 0
 
 		// write the udp data onto the data
-		binary.Write((*data)[offset:], binary.BigEndian, &udphdr)
+		binary.Write(data[offset:], binary.BigEndian, &udphdr)
 
 		// concatenate the checsum of the pseudohdr data and the udp header data
-		checksum := concat_checksum(psuedohdr_csum, calculate_checksum((*data)[offset:]))
+		checksum := concat_checksum(psuedohdr_csum, calculate_checksum(data[offset:]))
 
 		// set the udp checksum
-		binary.BigEndian.PutUint16((*data)[offset+6:], checksum)
-
+		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(udphdr.Checksum)):], checksum)
 	} else if hdr.Protocol == syscall.IPPROTO_TCP {
 		// read udp header
 		var tcphdr TCPHeader
-		binary.Read((*data)[offset:], binary.BigEndian, &tcphdr)
+		binary.Read(data[offset:], binary.BigEndian, &tcphdr)
 
 		pseudohdr.Protocol = syscall.IPPROTO_TCP
 
@@ -230,12 +265,12 @@ func replace_routing_information_ip4(data *bucket, saddr [4]byte, daddr [4]byte,
 		tcphdr.Checksum = 0
 
 		// write the tcp header data onto the data
-		binary.Write((*data)[offset:], binary.BigEndian, &tcphdr)
+		binary.Write(data[offset:], binary.BigEndian, &tcphdr)
 
 		// write the pseudohdr into a buffer so the checksum can be calculated
-		checksum := concat_checksum(psuedohdr_csum, calculate_checksum((*data)[offset:hdr.TotalLength]))
+		checksum := concat_checksum(psuedohdr_csum, calculate_checksum(data[offset:hdr.TotalLength]))
 		// set the tcp checksum
-		binary.BigEndian.PutUint16((*data)[offset+6:], checksum)
+		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(tcphdr.Checksum)):], checksum)
 	}
 
 	return nil
@@ -311,6 +346,27 @@ func (engine *IOEngine) ReleaseClient(client *client) {
 func (engine *IOEngine) match_received_packet_with_transaction(ethertype uint, data bucket) (matched_transactions []*transaction) {
 	saddr, daddr, protocol, sport, dport := read_packet_data((ethertype), data)
 
+	/* TODO: allow ICMP errors to be matched with a transaction */
+	/* Only handle  a select few ICMPv4 error codes */
+	if protocol == syscall.IPPROTO_ICMP {
+		// there should be better way of doing this instead of doing this garbage
+		// assume ipv4
+		var offset = 0
+
+		// read the iphdr lenght and increment offset
+		offset += int(data[0]&0xF) << 2 // some magic bs, I'm tired
+
+		// read icmp header
+		var icmphdr ICMPHeader
+		binary.Read(data[offset:], binary.BigEndian, &icmphdr)
+
+		// read the icmp type, if
+		if icmphdr.Type == 3 || icmphdr.Type == 5 || icmphdr.Type == 11 || icmphdr.Type == 12 || icmphdr.Type == 4 {
+			// NOTE: ports are swapped
+			_, _, protocol, dport, sport = read_packet_data(ethertype, data[offset+8:]) // magic number location where packet data should exist
+		}
+	}
+
 	/* Read transactions and find the requisite transactions*/
 	engine.transactions_mutex.RLock()
 	defer engine.transactions_mutex.RUnlock()
@@ -334,7 +390,6 @@ func (engine *IOEngine) match_received_packet_with_transaction(ethertype uint, d
 		}
 
 		if transaction.Proto != protocol {
-			/* TODO: allow ICMP errors to be matched with a transaction */
 			continue
 		}
 
@@ -429,13 +484,19 @@ func (engine *IOEngine) transaction_open(client *client, ethertype uint, data bu
 	transaction.Target_sport = int(target_sport)
 	transaction.Target_dport = dport
 
+	// Quick hack if the protocol is not UDP or TCP the the ports MUST be zero
+	if !(transaction.Proto == syscall.IPPROTO_UDP || transaction.Proto == syscall.IPPROTO_TCP) {
+		transaction.Target_sport = 0
+		transaction.Target_dport = 0
+	}
+
 	engine.transactions = append(engine.transactions, transaction)
 
 	return &engine.transactions[len(engine.transactions)-1], nil
 }
 
 // modify the fields of the packet data for packets coming from the OS
-func (engine *IOEngine) transaction_in_process(trans transaction, data *bucket) error {
+func (engine *IOEngine) transaction_in_process(trans transaction, data bucket) error {
 	var err error
 
 	/* Note that the for incoming packets the source and destination are swapped*/
@@ -456,7 +517,7 @@ func (engine *IOEngine) transaction_in_process(trans transaction, data *bucket) 
 }
 
 // modify the fields of the packet data for packets going to the OS
-func (engine *IOEngine) transaction_out_process(trans transaction, data *bucket) error {
+func (engine *IOEngine) transaction_out_process(trans transaction, data bucket) error {
 	var err error
 
 	if trans.Type == syscall.ETH_P_IP {
@@ -491,7 +552,10 @@ func (engine *IOEngine) SendPacket(client *client, ethertype uint, packet_data b
 	}
 
 	// set the requisite fields for the outgoing packet
-	engine.transaction_out_process(*t, &packet_data)
+	err = engine.transaction_out_process(*t, packet_data)
+	if err != nil {
+		return err // the packet won't be sent out_process indicated some kind of problem
+	}
 
 	// create destination socket address
 	sa := syscall.SockaddrInet4{
@@ -525,7 +589,7 @@ func (engine *IOEngine) ReceiveAndForward() error {
 
 		for _, t := range matches {
 			// overwrite the data with for each match because the processing function do not read the data
-			err := engine.transaction_in_process(*t, &data)
+			err := engine.transaction_in_process(*t, data)
 
 			if err != nil {
 				continue
@@ -652,6 +716,9 @@ func (clnt *client) send(op uint16, ethertype uint16, xid uint32, message []byte
 
 	binary.Write(msg_data, binary.BigEndian, &hdr) // write header into send buffer
 	copy(msg_data[OSIFS_HEADER_LENGTH:], message)  // copy message into send buffer
+
+	// pollute log
+	log.Printf("Sending message to client, version: %d, opcode: %d, cid: %d, xid: %d, ethertype: %d\n", hdr.Version, hdr.Opcode, hdr.Cid, hdr.Xid, hdr.Ethertype)
 
 	clnt.conn.WriteMessage(websocket.BinaryMessage, msg_data) // Send msg to ws-client
 }
