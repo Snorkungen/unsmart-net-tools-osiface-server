@@ -23,3 +23,31 @@ When registering a client the server, the server assigns a unique client id, tha
 ## Get Started
 
 > TODO
+
+### Client-Server communication
+The client and server communicate using a WebSocket connection, exchanging binary data. Each message **MUST** begin with a 14-byte header. The message header has the following fields in order:
+- Version
+- Opcode
+- Client ID
+- Transaction ID
+- Ethertype
+
+> The above fields are sent as big-endian values.
+
+![](./doc/binary-message-header.svg)
+*structure of the binary messages*
+
+The `Version` field **MUST** always be 0x1. The `Opcode` field informs the receiver what the message kind is. The following opcodes are:
+- INIT (0x1)
+- REPLY (0x2)
+- SEND_PACKET (0x8)
+
+An `INIT` message is sent when the WebSocket client wants to initialize a client, the WebSocket Client **SHOULD** fill the transaction with a unique value.
+
+A `REPLY` message is sent from the server when replying to client message, the reply messages transaction id field must correspond to message transaction id the server is replying to. If the server is responding to an `INIT` message the client id field must contain a unique id for the WebSocket connection.
+
+A `SEND_PACKET` message can be sent from either client or server. The client id and ethertype **MUST** be given.
+
+The `Client ID` **MUST** only be unique per WebSocket connection.
+
+The `Transaction ID` exists to allow a single WebSocket client, to have multiple server clients.
