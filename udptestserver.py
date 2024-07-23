@@ -65,9 +65,12 @@ def raw_udp_reply_with_received_addr():
 if __name__ == "__main__":
     # raw_udp_mulitple_response()
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("0.0.0.0", localPort))
-    data, addr = s.recvfrom(bufferSize)
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", localPort))
+        data, addr = s.recvfrom(bufferSize)
 
-    s.sendto(data, addr)
+        print("replying to: ", addr)
+
+        s.sendto(data, addr)
     

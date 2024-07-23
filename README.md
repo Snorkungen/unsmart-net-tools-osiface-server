@@ -22,11 +22,4 @@ When registering a client the server, the server assigns a unique client id, tha
 
 ## Get Started
 
-1. Download code.
-2. configure NATMan - osifaceserver.py
-3. run osifaceserver.py as root
-
-```sh
-# run as root
-python ./osifaceserver.py
-```
+> TODO
