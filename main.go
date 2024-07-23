@@ -29,7 +29,10 @@ type UDPHeader struct {
 type TCPHeader struct {
 	Sport    uint16
 	Dport    uint16
-	_        [12]byte // contains fields that are not needed for nat ops
+	P_1      uint32 // contains fields that are not needed for nat ops
+	P_2      uint32 // contains fields that are not needed for nat ops
+	P_3      uint16 // contains fields that are not needed for nat ops // 12 bytes
+	P_4      uint16 // contains fields that are not needed for nat ops // 12 bytes
 	Checksum uint16
 }
 
@@ -263,7 +266,6 @@ func replace_routing_information_ip4(data bucket, saddr [4]byte, daddr [4]byte, 
 
 		// reset the checsum
 		tcphdr.Checksum = 0
-
 		// write the tcp header data onto the data
 		binary.Write(data[offset:], binary.BigEndian, &tcphdr)
 

@@ -24,6 +24,9 @@ When registering a client the server, the server assigns a unique client id, tha
 
 > TODO
 
+## Server comments
+> Current implementation using linux sockets does not work with TCP
+
 ### Client-Server communication
 The client and server communicate using a WebSocket connection, exchanging binary data. Each message **MUST** begin with a 14-byte header. The message header has the following fields in order:
 - Version
