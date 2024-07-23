@@ -2,17 +2,23 @@ package main
 
 import "encoding/binary"
 
-// Checksum implementation inspired by <https://datatracker.ietf.org/doc/html/rfc1071#section-4.1>
+// Checksum implementation inspired by <https://datatracker.ietf.org/doc/html/rfc1071#section-4.1> <https://gist.github.com/Snorkungen/9aee12a4a32c9d85e5a72da07a487acf>
 func calculate_checksum(buf []byte) uint16 {
-	var sum uint32 = 0
+	var sum uint64 = 0
+	var i int = 0
+	var leftover_count = (len(buf) % 4)
 
-	for i := 0; i < len(buf)-1; i += 2 {
-		sum += uint32((uint16(buf[i]) << 8) | uint16(buf[i+1]))
+	for ; i < (len(buf) - leftover_count); i += 4 {
+		sum += (uint64(buf[i]) << 24) | (uint64(buf[i+1]) << 16) | (uint64(buf[i+2]) << 8) | uint64(buf[i+3])
 	}
 
-	// If the number of bytes was odd, add the last byte
-	if len(buf)&1 != 0 {
-		sum += (uint32(buf[len(buf)-1])) << 8
+	switch leftover_count {
+	case 1:
+		sum += (uint64(buf[i]) << 24)
+	case 2:
+		sum += (uint64(buf[i]) << 24) | (uint64(buf[i+1]) << 16)
+	case 3:
+		sum += (uint64(buf[i]) << 24) | (uint64(buf[i+1]) << 16) | (uint64(buf[i+2]) << 8)
 	}
 
 	// fold 32-bit sum to 16 bits
