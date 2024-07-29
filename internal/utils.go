@@ -1,9 +1,9 @@
-package main
+package internal
 
 import "encoding/binary"
 
 // Checksum implementation inspired by <https://datatracker.ietf.org/doc/html/rfc1071#section-4.1> <https://gist.github.com/Snorkungen/9aee12a4a32c9d85e5a72da07a487acf>
-func calculate_checksum(buf []byte) uint16 {
+func CalculateChecksum(buf []byte) uint16 {
 	var sum uint64 = 0
 	var i int = 0
 	var leftover_count = (len(buf) % 4)
@@ -30,7 +30,7 @@ func calculate_checksum(buf []byte) uint16 {
 }
 
 // add to two checsums togheter, ONLY WORKS if csum1 was derrived from a byte array with a size that is divisble by 2
-func concat_checksum(csum1 uint16, csum2 uint16) uint16 {
+func ConcatChecksum(csum1 uint16, csum2 uint16) uint16 {
 	var sum uint32 = uint32(csum1) + uint32(csum2)
 	if sum>>16 > 0 { // something about a carry bit
 		sum = (sum & 0xffff) + 1
@@ -44,26 +44,26 @@ func concat_checksum(csum1 uint16, csum2 uint16) uint16 {
 }
 
 // alias to allow for usage as Reader and Writer
-type bucket []byte
+type Bucket []byte
 
-func (b bucket) Read(p []byte) (int, error) {
+func (b Bucket) Read(p []byte) (int, error) {
 	copy(p, b)
 	return len(b), nil
 }
-func (b bucket) Write(p []byte) (int, error) {
+func (b Bucket) Write(p []byte) (int, error) {
 	copy(b, p)
 	return len(p), nil
 }
 
 // host to short
-func htons(i uint16) uint16 {
+func Htons(i uint16) uint16 {
 	b := make([]byte, 2)
 	binary.LittleEndian.PutUint16(b, (i))
 	return binary.BigEndian.Uint16(b)
 }
 
 // net to host short
-func ntohs(i uint16) uint16 {
+func Ntohs(i uint16) uint16 {
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, i)
 	return binary.LittleEndian.Uint16(b)
