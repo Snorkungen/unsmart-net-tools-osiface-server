@@ -265,9 +265,6 @@ func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr net.IP, ta
 		return target_saddr, target_daddr, target_sport, fmt.Errorf("destination not found")
 	}
 
-	target_saddr = make(net.IP, len(sourcer.target_saddr))
-	target_daddr = make(net.IP, len(sourcer.target_daddr))
-
 	// detect the network family
 	if tmp := destination.To4(); tmp != nil {
 		// addres is ipv4
@@ -475,6 +472,8 @@ func (engine *IOEngine) transaction_open(client Client, ethertype uint, data int
 
 	engine.transactions = append(engine.transactions, transaction)
 
+	PutListenerTransaction(transaction)
+
 	return &engine.transactions[len(engine.transactions)-1], nil
 }
 
@@ -550,54 +549,15 @@ func (engine *IOEngine) SendPacket(client Client, ethertype uint, packet_data []
 	return err
 }
 
-func (engine *IOEngine) ReceiveAndForward() error {
-	// A fun thing could be creating a free-list of buffers
-	buffer := make([]byte, 1600)
-	data_len, from, err := syscall.Recvfrom(engine.listening_socket, buffer, 0)
-
-	if err != nil {
-		return err
-	}
-
-	sa := from.(*syscall.SockaddrLinklayer)
-
-	// Nah man just spin up another thread, thread pool maybe ???
-	// Yes! this allows me to overengineer this, by for example creating a pool routines that have qeues of packets awating processing
-	go func(ethertype uint16, data internal.Bucket) {
-		matches := engine.match_received_packet_with_transaction(uint(ethertype), data)
-
-		if len(matches) == 0 {
-			return
-		}
-
-		for _, t := range matches {
-			// overwrite the data with for each match because the processing function do not read the data
-			err := engine.transaction_in_process(*t, data)
-
-			if err != nil {
-				continue
-			}
-			// Forward packet to client
-			if engine.forward_received != nil {
-				(*engine.forward_received)(t.Client, t.Ethertype, data)
-			}
-		}
-	}(internal.Ntohs(sa.Protocol), buffer[:data_len])
-
-	return nil
-}
-
 func (engine *IOEngine) StartListening() {
-	if engine.listening_socket < 0 {
+	err := AttachListeners()
+	if err != nil {
+		log.Fatal("attaching ebpf", err)
 		return
 	}
 
 	// start listening
-	go func() {
-		for {
-			engine.ReceiveAndForward()
-		}
-	}()
+	go ReceiveAndForward2(engine)
 }
 
 func (engine *IOEngine) Init() {
