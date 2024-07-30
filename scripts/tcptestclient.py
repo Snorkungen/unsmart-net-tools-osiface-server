@@ -1,7 +1,7 @@
 import socket
 from time import sleep
 
-serverAddressPort = ("192.168.1.201", 10011)
+serverAddressPort = ("0.0.0.0", 10011)
 bufferSize = 1024
 
 
