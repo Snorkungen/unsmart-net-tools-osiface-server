@@ -124,7 +124,6 @@ func ReceiveAndForward2(engine *IOEngine) {
 			return
 		}
 
-		fmt.Println(record)
 		// first 14-bytes are ethernet
 		var ethertype uint16 = binary.BigEndian.Uint16(record.RawSample[12:])
 

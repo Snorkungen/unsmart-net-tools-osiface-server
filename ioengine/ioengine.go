@@ -291,7 +291,6 @@ func (nm *NATMan) Get(destination net.IP) (target_saddr, target_daddr net.IP, ta
 
 // Begin of recreating the ioengine monstrosity
 type IOEngine struct {
-	listening_socket   int
 	sending_socket4    int
 	transactions       []Transaction
 	transactions_mutex sync.RWMutex
@@ -562,12 +561,6 @@ func (engine *IOEngine) StartListening() {
 
 func (engine *IOEngine) Init() {
 	var err error
-
-	engine.listening_socket, err = syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(internal.Htons(syscall.ETH_P_IP)))
-
-	if err != nil {
-		engine.listening_socket = -1 // there was a problem indicate that the there is a problem with the listening
-	}
 
 	engine.sending_socket4, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 
