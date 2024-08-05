@@ -124,6 +124,11 @@ func ReceiveAndForward2(engine *IOEngine) {
 			return
 		}
 
+		// read the data length
+		data_length := binary.BigEndian.Uint16(record.RawSample)
+		if data_length < 14 {
+			data_length = uint16(len(record.RawSample)) // in-case of something being wrong
+		}
 		// first 14-bytes are ethernet
 		var ethertype uint16 = binary.BigEndian.Uint16(record.RawSample[12:])
 
@@ -146,7 +151,7 @@ func ReceiveAndForward2(engine *IOEngine) {
 					(*engine.forward_received)(t.Client, t.Ethertype, data)
 				}
 			}
-		}(ethertype, record.RawSample[14:])
+		}(ethertype, record.RawSample[14:data_length])
 
 		// pass on record
 	}

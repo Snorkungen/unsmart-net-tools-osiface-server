@@ -273,11 +273,6 @@ int match_packets(struct xdp_md *ctx)
         *(__u64 *)(pkey.daddr + 8) = tmpl;
     }
 
-    // // just write pkey
-    // bpf_ringbuf_output(&packet_buffer, &pkey, sizeof(struct packet_key), 0);
-
-    // return XDP_PASS;
-
     __u64 *value = bpf_map_lookup_elem(&packet_keys, &pkey);
     if (value == NULL)
         return XDP_PASS;
@@ -296,6 +291,9 @@ int match_packets(struct xdp_md *ctx)
     {
         *(unsigned char *)(rb_data + i) = *(unsigned char *)data++;
     }
+
+    // Write ther data length as into the ethernet header
+    *(__u16 *)(rb_data) = htons((unsigned short)(ctx->data_end - ctx->data));
 
     bpf_ringbuf_submit(rb_data, 0);
 
