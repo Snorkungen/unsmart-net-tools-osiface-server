@@ -122,7 +122,8 @@ func replace_routing_information_ip4(data internal.Bucket, saddr [4]byte, daddr 
 				binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(icmphdr.Checksum)):], 0) // set the checksum field to zero
 
 				// write the checksum value into the icmp checksum field
-				checksum := internal.CalculateChecksum(data[offset:])
+				checksum := internal.CalculateChecksum(data[offset:hdr.TotalLength])
+
 				binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(icmphdr.Checksum)):], checksum) // I do not like magic numbers
 			}
 		default:
@@ -152,15 +153,13 @@ func replace_routing_information_ip4(data internal.Bucket, saddr [4]byte, daddr 
 		udphdr.Sport = sport
 		udphdr.Dport = dport
 
-		// reset the checsum
-		udphdr.Checksum = 0
-
 		// write the udp data onto the data
 		binary.Write(data[offset:], binary.BigEndian, &udphdr)
 
-		// concatenate the checsum of the pseudohdr data and the udp header data
-		checksum := internal.ConcatChecksum(psuedohdr_csum, internal.CalculateChecksum(data[offset:]))
-
+		// reset the checsum
+		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(udphdr.Checksum)):], 0)
+		// compute udp checksum
+		checksum := internal.ConcatChecksum(psuedohdr_csum, internal.CalculateChecksum(data[offset:hdr.TotalLength]))
 		// set the udp checksum
 		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(udphdr.Checksum)):], checksum)
 	} else if hdr.Protocol == syscall.IPPROTO_TCP {
@@ -174,12 +173,12 @@ func replace_routing_information_ip4(data internal.Bucket, saddr [4]byte, daddr 
 		tcphdr.Sport = sport
 		tcphdr.Dport = dport
 
-		// reset the checsum
-		tcphdr.Checksum = 0
 		// write the tcp header data onto the data
 		binary.Write(data[offset:], binary.BigEndian, &tcphdr)
 
-		// write the pseudohdr into a buffer so the checksum can be calculated
+		// reset the checsum
+		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(tcphdr.Checksum)):], 0)
+		// compute the tcp checksum
 		checksum := internal.ConcatChecksum(psuedohdr_csum, internal.CalculateChecksum(data[offset:hdr.TotalLength]))
 		// set the tcp checksum
 		binary.BigEndian.PutUint16(data[offset+int(unsafe.Offsetof(tcphdr.Checksum)):], checksum)
