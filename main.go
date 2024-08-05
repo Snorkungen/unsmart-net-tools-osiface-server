@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	"github.com/Snorkungen/unsmart-net-tools-osiface-server/internal"
 	osengine "github.com/Snorkungen/unsmart-net-tools-osiface-server/ioengine"
@@ -38,6 +39,7 @@ type OSIFSHeader struct {
 type client struct {
 	// some reference to the ws connection
 	conn *websocket.Conn
+	mx   sync.Mutex
 	id   int
 }
 
@@ -76,7 +78,9 @@ func (clnt *client) send(op uint16, ethertype uint16, xid uint32, message []byte
 
 // Server can only send packets and replies
 func (clnt *client) SendPacket(ethertype uint16, message []byte) {
+	clnt.mx.Lock()
 	clnt.send(OSIFS_OP_SEND_PACKET, ethertype, 0, message)
+	clnt.mx.Unlock()
 }
 
 func (clnt *client) SendReply(xid uint32, reply any) {
@@ -135,7 +139,7 @@ func (wsch *WSClientHandler) HandleInit(hdr OSIFSHeader, _ internal.Bucket) {
 		conn: wsch.conn,
 	})
 
-	client := wsch.clients[len(wsch.clients)-1]
+	var client *client = &wsch.clients[len(wsch.clients)-1]
 
 	// this is wher it would be good to have a abstraction that does the reading and logic that i require
 	client.SendReply(hdr.Xid, struct{}{}) // client expects at least {} return value to be an object, although In EcmaScript everything is an object

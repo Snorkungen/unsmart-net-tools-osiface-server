@@ -15,5 +15,9 @@ if __name__ == "__main__":
     while True:
         tcp_sock, addr = s.accept()
         print("sending hello to:", addr)
+
         tcp_sock.send(b"Hello world")
-        tcp_sock.close()
+
+        msg = tcp_sock.recv(bufferSize)
+        print("received msg", str(msg))
+        # tcp_sock.close()
